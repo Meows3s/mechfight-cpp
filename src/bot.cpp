@@ -943,13 +943,15 @@ class MechBot final : public Bot {
     for (const auto& s : hide_spots_) {
       const double dc = hypot2(s.x - zone.center[0], s.y - zone.center[1]);
       if (dc > zone.radius - margin) continue;
-      double rank = s.cover * 300.0 - 0.2 * dc - 0.12 * hypot2(s.x - me_xy[0], s.y - me_xy[1]);
+      const double d_me = hypot2(s.x - me_xy[0], s.y - me_xy[1]);
+      double rank = s.cover * 300.0 - 0.2 * dc - 0.12 * d_me;
       if (s.x == hide_tx_ && s.y == hide_ty_) rank += 25.0;  // stickiness
       if (spotter) {
         const double ds = hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]);
         rank += std::min(ds, 250.0) * 1.5;
-        if (have_map_ && !map_.shot_los(threat_muz, {s.x, s.y, s.z + 4.5})) {
-          // A building is actually between this spot and the shooter.
+        // Beyond 285 m no weapon can reach; within 160 m of us, raycast to
+        // verify a building actually blocks the shooter's line of sight.
+        if (d_me <= 160.0 && (ds > 285.0 || (have_map_ && !map_.shot_los(threat_muz, {s.x, s.y, s.z + 4.5})))) {
           rank += 450.0;
           if (mortar_armed && ds >= 125.0 && ds <= 215.0) rank += 200.0;
         }
