@@ -1,12 +1,16 @@
 // bot.cpp - the policy.
 //
-// M2 priorities, in order:
+// Priorities, in order:
 //   1. stay inside the circle the zone is closing to, a few seconds ahead
 //   2. never walk into a wall: steering probes the map and picks the clearest
 //      direction that still points at the goal
-//   3. face whatever is shooting at us, so its fire lands in the front arc
+//   3. farm power cubes (crates and NPC drones) while it is safe to do so --
+//      cubes are +4% max HP and +4% damage each up to 10, which is what decides
+//      the late brawl
+//   4. break off and fight only when an enemy is actually close
+//   5. face whatever is shooting at us, so its fire lands in the front arc
 //      instead of the 1.5x rear arc
-//   4. only shoot when the map says the shot is not going into a building
+//   6. shoot only with a clear shot, tested against the map
 //
 // Everything reads live numbers from hello.config. The map is loaded once.
 #include "bot.hpp"
@@ -58,6 +62,8 @@ class MechBot final : public Bot {
         min_pitch_(hello.cfg("mech", "min_pitch", -0.7)),
         max_pitch_(hello.cfg("mech", "max_pitch", 1.3)),
         standoff_(hello.cfg("sound", "near", 60.0) + 20.0),
+        cube_radius_(hello.cfg("cubes", "pickup_radius", 3.5)),
+        crate_drop_(hello.cfg("crates", "height", 2.4) * 0.5),
         rng_(static_cast<std::uint32_t>(hello.seed) | 1u) {
     have_map_ = map_.load(hello.map_dir, hello.map_files);
     if (have_map_) {
@@ -89,13 +95,22 @@ class MechBot final : public Bot {
       }
     threat_age_ += dt;
 
-    const Actor* target = pick_target(o, me_xy);
-    const double dist = target ? dist3(muzzle(me), centre(*target)) : 0.0;
-    const bool los = target && (!have_map_ || map_.shot_los(muzzle(me), centre(*target)));
+    const Vec3 m = muzzle(me);
+    const Circle zone = predicted_zone(o);
+    const double margin = mech_radius_ + 6.0;
+    const bool settled = dist2(me_xy, zone.center) <= zone.radius - margin;
 
-    steer(a, o, me, me_xy, target);
-    aim_and_fire(a, me, target, dist, los);
-    draw(a, o, me, target);
+    const Actor* enemy = nearest_mech(o, me_xy);
+    const double enemy_d = enemy ? dist3(m, centre(*enemy)) : 1e18;
+    const bool engage = enemy != nullptr && enemy_d <= kDefendRange;
+
+    // Farm only when nothing is close enough to be a problem. Past the stat cap
+    // cubes still make the mech bigger with no damage or HP benefit, so stop.
+    const Farm farm = (!engage && me.cubes < kCubeTarget) ? pick_farm(o, zone, margin) : Farm{};
+
+    steer(a, o, me, me_xy, zone, settled, engage ? enemy : nullptr, farm);
+    aim_and_fire(a, me, enemy, farm);
+    draw(a, o, me, zone, engage ? enemy : nullptr, farm);
     return a;
   }
 
@@ -104,6 +119,20 @@ class MechBot final : public Bot {
     Vec2 center{};
     double radius = 0.0;
   };
+
+  // Something worth shooting for cubes.
+  struct Farm {
+    enum class Kind { None, Crate, Drone };
+    Kind kind = Kind::None;
+    const Actor* drone = nullptr;
+    const Item* crate = nullptr;
+    Vec3 point{};  // where to aim
+    double dist = 1e18;
+  };
+
+  static constexpr double kDefendRange = 110.0;  // engage an enemy inside this
+  static constexpr double kCubeTarget = 10.0;    // cubes.cap: HP and damage stop here
+  static constexpr double kFarmRadius = 110.0;   // how far to detour for cubes
 
   // ---------------------------------------------------------------- geometry
 
@@ -141,6 +170,13 @@ class MechBot final : public Bot {
     return c;
   }
 
+  // Crates on rooftops are unreachable without a climb; skip anything sitting
+  // well above the ground under it.
+  bool reachable(const Vec3& pos) const {
+    if (!have_map_) return true;
+    return pos[2] - map_.terrain_h(pos[0], pos[1]) <= 3.0;
+  }
+
   // ---------------------------------------------------------------- decisions
 
   void take_upgrade(Action& a, const Obs& o) const {
@@ -171,7 +207,7 @@ class MechBot final : public Bot {
     if (want >= 0) a.take_id = want;
   }
 
-  const Actor* pick_target(const Obs& o, const Vec2& me_xy) const {
+  const Actor* nearest_mech(const Obs& o, const Vec2& me_xy) const {
     const Actor* best = nullptr;
     double best_d = 1e18;
     for (const auto& m : o.mechs) {
@@ -182,14 +218,40 @@ class MechBot final : public Bot {
         best = &m;
       }
     }
-    if (best) return best;
-    for (const auto& m : o.mechs) {
-      const double d = dist2(xy(m.pos), me_xy);
-      if (d < best_d) {
-        best_d = d;
-        best = &m;
+    return best;
+  }
+
+  // Best cube source: closest per unit value, inside the circle we are heading
+  // to, on reachable ground. A drone drops 2 cubes but shoots back, and a crate
+  // can drop the weapon for our empty slot, so the weights are not just cubes.
+  Farm pick_farm(const Obs& o, const Circle& zone, double margin) const {
+    const bool want_weapon = !o.self.has_weapon[1];
+    const Vec3 m = muzzle(o.self);
+    Farm best;
+    double best_score = 1e18;
+
+    auto consider = [&](Farm::Kind kind, const Actor* drone, const Item* crate, const Vec3& aim,
+                        double value) {
+      if (!reachable(aim)) return;
+      if (dist2(xy(aim), zone.center) > zone.radius - margin) return;  // outside where we must be
+      const double d = dist3(m, aim);
+      if (d > kFarmRadius) return;
+      const double score = d / value;
+      if (score < best_score) {
+        best_score = score;
+        best.kind = kind;
+        best.drone = drone;
+        best.crate = crate;
+        best.point = aim;
+        best.dist = d;
       }
-    }
+    };
+
+    for (const auto& c : o.crates)
+      consider(Farm::Kind::Crate, nullptr, &c, {c.pos[0], c.pos[1], c.pos[2] + crate_drop_},
+               want_weapon ? 1.6 : 1.0);
+    for (const auto& a : o.mechs)
+      if (a.npc) consider(Farm::Kind::Drone, &a, nullptr, centre(a), want_weapon ? 2.4 : 2.0);
     return best;
   }
 
@@ -217,46 +279,84 @@ class MechBot final : public Bot {
     return best;
   }
 
-  void steer(Action& a, const Obs& o, const Self& me, const Vec2& me_xy, const Actor* target) {
-    const Circle zone = predicted_zone(o);
-    const double to_centre = dist2(me_xy, zone.center);
-    const double margin = mech_radius_ + 6.0;
-    const bool settled = to_centre <= zone.radius - margin;
-
-    Vec2 desired{};
+  void steer(Action& a, const Obs& o, const Self& me, const Vec2& me_xy, const Circle& zone,
+             bool settled, const Actor* engage, const Farm& farm) {
     if (!settled) {
       // Priority 1: get inside the circle the zone is closing to.
-      desired = norm_or({zone.center[0] - me_xy[0], zone.center[1] - me_xy[1]}, {1.0, 0.0});
-      a.boost = !me.in_zone && to_centre > 25.0;
-    } else if (const Pickup* loot = want_loot(o, zone, me_xy, margin)) {
-      desired = norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]}, {1.0, 0.0});
-    } else if (target) {
-      // Hold station at standoff range and keep sliding sideways: a moving
-      // target is harder to lead.
+      a.move = avoid(me.pos, norm_or({zone.center[0] - me_xy[0], zone.center[1] - me_xy[1]},
+                                     {1.0, 0.0}),
+                     12.0);
+      a.boost = !me.in_zone && dist2(me_xy, zone.center) > 25.0;
+      return;
+    }
+
+    // A cube already on the ground is free: it only needs walking over. This
+    // outranks everything except the zone itself.
+    if (const Item* cube = nearest_cube(o, me_xy, zone)) {
+      a.move = avoid(me.pos, norm_or({cube->pos[0] - me_xy[0], cube->pos[1] - me_xy[1]},
+                                     {1.0, 0.0}),
+                     12.0);
+      return;
+    }
+
+    if (const Pickup* loot = want_loot(o, zone, me_xy)) {
+      a.move = avoid(me.pos, norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]},
+                                     {1.0, 0.0}),
+                     12.0);
+      return;
+    }
+
+    if (engage) {
+      // Hold station at standoff range and slide sideways: a moving target is
+      // harder to lead.
       if (o.t >= strafe_until_) {
         strafe_sign_ = (next_rand() & 1u) ? 1.0 : -1.0;
         strafe_until_ = o.t + 2.0 + 2.0 * ((next_rand() >> 8) * (1.0 / 16777216.0));
       }
-      const Vec2 to{target->pos[0] - me_xy[0], target->pos[1] - me_xy[1]};
+      const Vec2 to{engage->pos[0] - me_xy[0], engage->pos[1] - me_xy[1]};
       const Vec2 u = norm_or(to, {1.0, 0.0});
       const double L = hypot2(to[0], to[1]);
       const double radial = L > standoff_ + 12.0 ? 1.0 : (L < standoff_ - 12.0 ? -1.0 : 0.0);
-      desired = norm_or({u[0] * radial - u[1] * strafe_sign_ * 0.9,
-                         u[1] * radial + u[0] * strafe_sign_ * 0.9}, u);
-    } else {
-      desired = norm_or({zone.center[0] - me_xy[0], zone.center[1] - me_xy[1]}, {1.0, 0.0});
+      a.move = avoid(me.pos,
+                     norm_or({u[0] * radial - u[1] * strafe_sign_ * 0.9,
+                              u[1] * radial + u[0] * strafe_sign_ * 0.9},
+                             u),
+                     12.0);
+      return;
     }
 
-    a.move = avoid(me.pos, desired, 12.0);
+    if (farm.kind != Farm::Kind::None) {
+      a.move = avoid(me.pos, norm_or({farm.point[0] - me_xy[0], farm.point[1] - me_xy[1]},
+                                     {1.0, 0.0}),
+                     12.0);
+      return;
+    }
+
+    a.move = avoid(me.pos,
+                   norm_or({zone.center[0] - me_xy[0], zone.center[1] - me_xy[1]}, {1.0, 0.0}),
+                   12.0);
   }
 
-  // A pickup worth detouring for: free slot, a real weapon, and comfortably
-  // inside the circle we are heading to.
-  const Pickup* want_loot(const Obs& o, const Circle& zone, const Vec2& me_xy,
-                          double margin) const {
+  const Item* nearest_cube(const Obs& o, const Vec2& me_xy, const Circle& zone) const {
+    const Item* best = nullptr;
+    double best_d = 45.0;
+    for (const auto& c : o.cubes) {
+      if (dist2(xy(c.pos), zone.center) > zone.radius) continue;
+      const double d = dist2(xy(c.pos), me_xy);
+      if (d <= cube_radius_) continue;  // already in pickup range; the server collects it
+      if (d < best_d) {
+        best_d = d;
+        best = &c;
+      }
+    }
+    return best;
+  }
+
+  const Pickup* want_loot(const Obs& o, const Circle& zone, const Vec2& me_xy) const {
     if (o.self.has_weapon[1]) return nullptr;
     const Pickup* best = nullptr;
     double best_d = 60.0;
+    const double margin = mech_radius_ + 6.0;
     for (const auto& p : o.pickups) {
       if (p.kind == WeaponKind::Gun) continue;
       if (dist2(xy(p.pos), zone.center) > zone.radius - margin) continue;
@@ -271,22 +371,44 @@ class MechBot final : public Bot {
 
   // ---------------------------------------------------------------- aiming
 
-  void aim_and_fire(Action& a, const Self& me, const Actor* target, double dist, bool los) const {
-    if (!target) {
-      // Nothing to shoot: face whatever last shot at us, so its next hit lands
-      // in the front arc rather than the 1.5x rear one.
+  void aim_and_fire(Action& a, const Self& me, const Actor* enemy, const Farm& farm) const {
+    const Vec3 m = muzzle(me);
+    const double enemy_d = enemy ? dist3(m, centre(*enemy)) : 1e18;
+
+    // What to shoot: an enemy that is actually close, otherwise the farm
+    // target, otherwise the distant enemy, otherwise nothing.
+    Vec3 pt{};
+    Vec3 vel{0.0, 0.0, 0.0};
+    bool lead = false;
+    double d = 1e18;
+    if (enemy && enemy_d <= kDefendRange) {
+      pt = centre(*enemy);
+      vel = enemy->vel;
+      lead = true;
+      d = enemy_d;
+    } else if (farm.kind != Farm::Kind::None) {
+      pt = farm.point;
+      d = farm.dist;
+      if (farm.drone) {
+        vel = farm.drone->vel;
+        lead = true;
+      }
+    } else if (enemy) {
+      pt = centre(*enemy);
+      vel = enemy->vel;
+      lead = true;
+      d = enemy_d;
+    } else {
       a.aim = (threat_age_ < 4.0) ? Vec2{threat_bearing_, me.aim[1]} : me.aim;
       return;
     }
 
-    const Vec3 m = muzzle(me);
-    const Vec3 c = centre(*target);
     const double speed =
         (me.has_weapon[0] && me.weapons[0].speed > 1.0) ? me.weapons[0].speed : 252.0;
-    const double tof = dist / speed;
-    const double px = c[0] + target->vel[0] * tof;
-    const double py = c[1] + target->vel[1] * tof;
-    const double pz = c[2] + target->vel[2] * tof;
+    const double tof = lead ? d / speed : 0.0;
+    const double px = pt[0] + vel[0] * tof;
+    const double py = pt[1] + vel[1] * tof;
+    const double pz = pt[2] + vel[2] * tof;
     const double hd = hypot2(px - m[0], py - m[1]);
     double pitch = std::atan2(pz - m[2], hd);
     pitch = std::clamp(pitch, min_pitch_, max_pitch_);
@@ -295,32 +417,42 @@ class MechBot final : public Bot {
     // Slot 0: the arm gun. Fire inside range, and only with a clear shot.
     if (me.has_weapon[0]) {
       const Weapon& w = me.weapons[0];
-      a.fire[0] = los && dist <= weapon_range(w);
+      const bool los = !have_map_ || map_.shot_los(m, pt);
+      a.fire[0] = los && d <= weapon_range(w);
       if (w.kind == WeaponKind::Gun && w.ammo <= 0.0 && w.reload <= 0.0) a.reload = true;
     }
     // Slot 1: only the lightning is safe to hold. Laser and mortar need real
-    // charge/arc handling, which is milestone 3.
+    // charge/arc handling, which is still outstanding.
     if (me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Lightning)
-      a.fire[1] = dist <= weapon_range(me.weapons[1]);
+      a.fire[1] = d <= weapon_range(me.weapons[1]);
   }
 
   // ---------------------------------------------------------------- drawing
 
-  void draw(Action& a, const Obs& o, const Self& me, const Actor* target) const {
-    const Circle zone = predicted_zone(o);
+  void draw(Action& a, const Obs& o, const Self& me, const Circle& zone, const Actor* enemy,
+            const Farm& farm) const {
     for (int i = 0; i < 12; ++i) {
       const double th = i * (2.0 * kPi / 12.0);
       a.draw.point({zone.center[0] + std::cos(th) * zone.radius,
                     zone.center[1] + std::sin(th) * zone.radius, me.pos[2]},
                    "#40c0ff", 4.0);
     }
-    if (target) {
-      a.draw.line(muzzle(me), centre(*target), "#ff5040");
-      a.draw.text("T" + std::to_string(target->id), centre(*target), "#ffd060");
+    if (enemy) {
+      a.draw.line(muzzle(me), centre(*enemy), "#ff5040");
+      a.draw.text("E" + std::to_string(enemy->id), centre(*enemy), "#ffd060");
     }
-    a.draw.label("hp " + std::to_string(static_cast<int>(me.hp)) + " z" +
-                 std::to_string(static_cast<int>(zone.radius)) + " alive " +
-                 std::to_string(o.alive) + (have_map_ ? "" : " NOMAP"));
+    if (farm.kind != Farm::Kind::None) {
+      a.draw.line(muzzle(me), farm.point, "#40ff90");
+      a.draw.point(farm.point, "#40ff90", 8.0);
+    }
+    const char* mode = farm.kind == Farm::Kind::Drone ? "drone"
+                       : farm.kind == Farm::Kind::Crate ? "crate"
+                                                        : "";
+    a.draw.label("hp " + std::to_string(static_cast<int>(me.hp)) + " c" +
+                 std::to_string(static_cast<int>(me.cubes)) + "/" +
+                 std::to_string(static_cast<int>(kCubeTarget)) + " z" +
+                 std::to_string(static_cast<int>(zone.radius)) + " a" +
+                 std::to_string(o.alive) + " " + mode + (have_map_ ? "" : " NOMAP"));
   }
 
   Map map_;
@@ -330,6 +462,8 @@ class MechBot final : public Bot {
   double min_pitch_;
   double max_pitch_;
   double standoff_;
+  double cube_radius_;
+  double crate_drop_;
   double mech_height_ = 9.0;
   double mech_radius_ = 2.5;
   double step_up_ = 1.5;

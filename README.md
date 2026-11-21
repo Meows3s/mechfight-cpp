@@ -13,9 +13,10 @@ under `src/` is ours.
 | Check | Result |
 | --- | --- |
 | `check/check.py`, native | **PASS** — 300/300 in time, p99 5.4 ms |
-| `check/check.py`, match sandbox (1 CPU, 512 MB, read-only, uid 65534, no network) | **PASS** — 300/300 in time, p99 6.3 ms, max 6.6 ms |
+| `check/check.py`, match sandbox (1 CPU, 512 MB, read-only, uid 65534, no network) | **PASS** — 300/300 in time, p99 4.7 ms, max 6.8 ms |
 | `tools/verify_map.py` — map model vs. an independent reimplementation | **PASS** — 660 terrain queries 0 mismatches, 3960 prism queries 0 mismatches |
-| `tools/trace_assert.py` — audit of all 300 recorded decisions | **PASS** — 0 wall-bound moves out of 300 probes, plus 4 forced synthetic paths |
+| `tools/trace_assert.py` — audit of all 300 recorded decisions | **PASS** — 0 wall-bound moves out of 300 probes |
+| `tools/trace_assert.py` — forced synthetic policy paths | **PASS** — 7 paths the stream never reaches (zone run, loot take, upgrade pick, wall probe, crate farm, cube collect, cube cap) |
 | Build time in Docker | ~100 s (limit 10 min) |
 | Practice score | not submitted yet |
 
@@ -93,14 +94,21 @@ Priority order in `act()`:
    asks the map how far each is clear for, and takes the clearest one that still
    points at the goal. Walls, ledges taller than `step_up`, and slopes over
    `max_slope_deg` all count as blocked.
-3. **Detour for loot** only when a weapon slot is empty and the pickup sits
-   comfortably inside the circle we are heading to.
-4. **Hold station at standoff range** from the nearest visible mech and slide
-   sideways, flipping direction every 2-4 s off `hello.seed` so it is not a
-   predictable orbit.
-5. **Face the threat when idle.** Rear hits take `mech.rear_mult` (1.5x), so the
+3. **Farm power cubes** while it is safe: the best crate or NPC drone per unit
+   distance, inside the circle it is heading to and on reachable ground. Crates
+   on rooftops are filtered out, because walking to a crate 10 m up is wasted
+   time. Drones are weighted higher (2 cubes) but crates win when a weapon slot
+   is empty, since half of them drop a weapon.
+4. **Walk over loose cubes** — they are free and already on the ground — and
+   detour for a weapon only when a slot is empty.
+5. **Stop at 10 cubes.** That is `cubes.stat_cap`: past it, cubes still scale the
+   mech 5% bigger each with no HP or damage gain, which is pure downside.
+6. **Break off and fight** only when an enemy is inside 110 m; otherwise it keeps
+   farming. Then hold standoff range and slide sideways, flipping direction
+   every 2-4 s off `hello.seed` so it is not a predictable orbit.
+7. **Face the threat when idle.** Rear hits take `mech.rear_mult` (1.5x), so the
    torso turns toward whatever last damaged us (`damaged.bearing`).
-6. **Only fire with a clear shot** — the map's line-of-sight test rejects shots
+8. **Only fire with a clear shot** — the map's line-of-sight test rejects shots
    that would go into a building — leading the target by the gun's muzzle
    velocity and reloading when the magazine is dry.
 
@@ -112,9 +120,12 @@ Priority order in `act()`:
 - The laser is never charged/released and the mortar has no ballistic solver —
   only the gun and lightning are fired. Slot 1 will happily pick up a laser and
   then never use it.
-- No supply-drop play, no crate or NPC farming, so no cube scaling.
+- No supply-drop play. Drops are worth 3 cubes plus a full heal, but they pin
+  you in an 8 m ring for 4 s and are announced to everyone, which against a
+  squad that hunts you is a good way to die.
 - No incoming-fire model: projectiles are in the observation but nothing dodges
-  them yet, and there is no low-HP disengage.
+  them yet, and there is no low-HP disengage. Farming makes noise — a gunshot
+  carries 320 m — so this is the most likely thing to get us killed next.
 - Threat facing only remembers the last `damaged` bearing for 4 s; it does not
   fuse `sounds` or `beams` into a picture of where enemies are.
 - Local checks measure behaviour, not placement. See `docs/strategy.md`.

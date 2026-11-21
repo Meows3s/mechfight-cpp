@@ -120,7 +120,10 @@ final 4 matches are live.
   against an independent reimplementation), obstacle-aware steering, predictive
   zone seeking, threat-facing, shot line-of-sight. `tools/trace_assert.py` now
   audits every recorded decision and forces the paths the stream never reaches.
-- **M3.** Threat/dodge model, HP-aware disengage, laser charge-and-release,
-  mortar arc solver.
-- **M4.** Cube/NPC/crate farming, supply-drop decisions, late-game brawl policy.
-- **M5.** Submit, measure, tune; lock the best entry well before the cutoff.
+- **M3 (done).** Map-aware farming: best crate or drone per unit distance,
+  filtered to reachable ground inside the target circle; walks over loose cubes;
+  stops at the 10-cube stat cap; engages only inside 110 m.
+- **M4.** Threat/dodge model and low-HP disengage (farming is loud, and nothing
+  dodges incoming fire yet), then laser charge-and-release and a mortar arc
+  solver.
+- **M5.** Submit early, measure, tune; lock the best entry well before the cutoff.

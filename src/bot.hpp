@@ -11,6 +11,7 @@ using mf::Actor;
 using mf::Action;
 using mf::Bot;
 using mf::Hello;
+using mf::Item;
 using mf::Obs;
 using mf::Pickup;
 using mf::Self;

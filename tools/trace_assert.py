@@ -136,8 +136,29 @@ class Bot:
 # observations force them, and check the answer is the intended one.
 
 
-def synthetic(bot, base, g):
+def ground_base(obs, g):
+    """An observation where the mech stands on real ground with 10 m of clear
+    space to the east. The recorded stream has the mech on rooftops much of the
+    time, and a crate placed at a rooftop's height is correctly judged
+    unreachable, so the farming tests need a ground-level anchor."""
+    for o in obs:
+        x, y, z = o["self"]["pos"]
+        if not (-512 <= x <= 555 and -333 <= y <= 388):
+            continue
+        if abs(z - g.terrain_h(x, y)) >= 1.0:
+            continue
+        if g.clearance(x, y, z, 1.0, 0.0, 10.0, 9.0) < 10.0:
+            continue
+        return o
+    return obs[len(obs) // 2]
+
+
+def synthetic(bot, obs, g):
     out = {}
+    base = ground_base(obs, g)
+    bx, by, bz = base["self"]["pos"]
+    out["base_tick"] = base["tick"]
+    out["base_on_ground"] = abs(bz - g.terrain_h(bx, by)) < 1.0
 
     # 1. Well outside the zone, nothing else to do: must run for the centre.
     o = json.loads(json.dumps(base))
@@ -209,6 +230,70 @@ def synthetic(bot, base, g):
         out["wall_pass"] = out["wall_clearance"] >= 1.5
     else:
         out["wall_pass"] = False
+
+    # 5. A crate in the open, nothing else to shoot, no cubes yet: must pick it
+    #    as the target, aim at it, and fire. This is the farming path with the
+    #    ordinary gun.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900005
+    o["mechs"] = []
+    o["pickups"] = []
+    o["cubes"] = []
+    o["offer"] = None
+    o["self"]["cubes"] = 0
+    o["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
+    o["self"]["in_zone"] = True
+    x, y, z = o["self"]["pos"]
+    o["crates"] = [{"id": 1007, "pos": [x + 6.0, y, g.terrain_h(x + 6.0, y)], "hp": 300.0}]
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    want_yaw = math.atan2(0.0, 6.0)
+    aim_yaw = act.get("aim", [1e9, 0.0])[0]
+    out["crate_aim_err"] = round(abs((aim_yaw - want_yaw + math.pi) % (2 * math.pi) - math.pi), 4)
+    out["crate_fire"] = bool(act.get("fire", [False, False])[0])
+    mv = act.get("move", [0.0, 0.0])
+    out["crate_approach"] = round(mv[0] / max(1e-9, math.hypot(*mv)), 3)
+    out["crate_pass"] = (out["crate_aim_err"] < 0.15 and out["crate_fire"]
+                         and out["crate_approach"] > 0.8)
+
+    # 6. A cube on the ground: must walk at it to collect it.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900006
+    o["mechs"] = []
+    o["crates"] = []
+    o["pickups"] = []
+    o["offer"] = None
+    o["self"]["cubes"] = 0
+    o["self"]["in_zone"] = True
+    o["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
+    x, y, z = o["self"]["pos"]
+    o["cubes"] = [{"id": 5012, "pos": [x + 10.0, y, z]}]
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    mv = act.get("move", [0.0, 0.0])
+    out["cube_approach"] = round(mv[0] / max(1e-9, math.hypot(*mv)), 3)
+    out["cube_pass"] = out["cube_approach"] > 0.8
+
+    # 7. Past the stat cap the bot must stop farming: cubes make the mech bigger
+    #    with no HP or damage gain after 10.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900007
+    o["mechs"] = []
+    o["pickups"] = []
+    o["cubes"] = []
+    o["offer"] = None
+    o["self"]["cubes"] = 12
+    o["self"]["in_zone"] = True
+    o["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
+    x, y, z = o["self"]["pos"]
+    o["crates"] = [{"id": 1008, "pos": [x + 6.0, y, g.terrain_h(x + 6.0, y)], "hp": 300.0}]
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    out["cap_fire"] = bool(act.get("fire", [False, False])[0])
+    out["cap_pass"] = not out["cap_fire"]  # refuses to farm past the cap
     return out
 
 
@@ -296,7 +381,9 @@ def main():
             elif math.dist(hit[0]["pos"][:2], (x, y)) > pickup_r + 0.01:
                 counts["take_out_of_range"] += 1
 
-        if act.get("fire", [False, False])[0] and not o["mechs"]:
+        # Firing with nothing visible at all is a bug. Firing with no MECH
+        # visible is legitimate: the bot shoots crates to farm cubes.
+        if act.get("fire", [False, False])[0] and not (o["mechs"] or o["crates"]):
             counts["fire_no_target"] += 1
 
         # Did we walk into a wall? Probe the chosen direction against the map.
@@ -330,10 +417,13 @@ def main():
                     if len(zone_examples) < 5:
                         zone_examples.append((o["tick"], round(math.dist((x, y), (cx, cy)), 1), round(cr, 1), round(dot, 2)))
 
-    syn = synthetic(bot, obs[len(obs) // 2], g)
+    syn = synthetic(bot, obs, g)
     print("synthetic policy checks (paths the recorded stream never reaches):")
-    for k in ("zone_run_dot", "zone_run_boost", "zone_run_pass", "take_id", "take_pass",
-              "pick", "pick_pass", "wall_clearance", "wall_pass"):
+    for k in ("base_tick", "base_on_ground",
+              "zone_run_dot", "zone_run_boost", "zone_run_pass", "take_id", "take_pass",
+              "pick", "pick_pass", "wall_clearance", "wall_pass",
+              "crate_aim_err", "crate_fire", "crate_approach", "crate_pass",
+              "cube_approach", "cube_pass", "cap_fire", "cap_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")
