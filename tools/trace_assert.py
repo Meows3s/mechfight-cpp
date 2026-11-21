@@ -153,7 +153,7 @@ def ground_base(obs, g):
     return obs[len(obs) // 2]
 
 
-def synthetic(bot, obs, g):
+def synthetic(bot, obs, g, cfg):
     out = {}
     base = ground_base(obs, g)
     bx, by, bz = base["self"]["pos"]
@@ -294,6 +294,115 @@ def synthetic(bot, obs, g):
     act = json.loads(bot.next_line())
     out["cap_fire"] = bool(act.get("fire", [False, False])[0])
     out["cap_pass"] = not out["cap_fire"]  # refuses to farm past the cap
+
+    # ---------------------------------------------------------- M4 weapons
+    # The mortar arc, the laser charge/release, and the fight maths all have
+    # exact answers, so assert against them rather than against "it fired".
+
+    def mkweapon(kind, damage, cd, speed, rng, charge=-1.0, mag=0.0, reload_s=0.0):
+        return {"kind": kind, "cooldown": 0.0, "ammo": -1.0, "reload": -1.0, "charge": charge,
+                "stats": {"damage": damage, "cooldown": cd, "speed": speed, "range": rng,
+                          "spread_deg": 0.0, "mag": mag, "reload": reload_s}}
+
+    def duel(tick, weapons, dist_east, enemy_hp, extra_lasers=0):
+        d = json.loads(json.dumps(base))
+        d["tick"] = tick
+        d["t"] = 100.0
+        d["offer"] = None
+        d["events"] = []
+        d["pickups"] = []
+        d["crates"] = []
+        d["cubes"] = []
+        d["self"]["cubes"] = 0
+        d["self"]["hp"] = 1400.0
+        d["self"]["energy"] = 100.0
+        d["self"]["in_zone"] = True
+        d["self"]["aim"] = [0.0, 0.0]
+        d["self"]["weapons"] = weapons
+        d["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
+                     "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0,
+                     "dps": 20.0}
+        x, y, z = d["self"]["pos"]
+
+        def enemy(i, ex, ey, hp, kinds):
+            return {"id": i, "npc": False, "pos": [ex, ey, g.terrain_h(ex, ey)],
+                    "vel": [0.0, 0.0, 0.0], "aim": [0.0, 0.0], "hp": hp, "max_hp": 1400.0,
+                    "cubes": 0.0, "weapons": kinds}
+
+        d["mechs"] = [enemy(77, x + dist_east, y, enemy_hp, ["gun"])]
+        for i in range(extra_lasers):
+            d["mechs"].append(enemy(80 + i, x + dist_east, y - 20.0 - 5.0 * i, 1400.0, ["laser"]))
+        return d
+
+    gun0 = base["self"]["weapons"][0]
+    mcfg = (cfg.get("weapons") or {}).get("mortar") or {}
+    mv, mg = mcfg.get("speed", 72.0), mcfg.get("gravity", 22.0)
+    lc = ((cfg.get("weapons") or {}).get("laser") or {}).get("charge", 0.75)
+
+    def arc_pitch(obs_like, dist_east, lob):
+        """The launch pitch the mortar should return, computed from the closed
+        form independently of the C++ (src/ballistics.hpp)."""
+        x, y, z = obs_like["self"]["pos"]
+        mz = z + obs_like["self"]["stats"].get("muzzle_height", 7.0)
+        ex, ey = x + dist_east, y
+        tz = g.terrain_h(ex, ey) + 4.5  # centre() of a mech with no cubes
+        dd = math.hypot(ex - x, ey - y)
+        dz = tz - mz
+        A = mg * dd * dd / (2.0 * mv * mv)
+        disc = dd * dd - 4.0 * A * (dz + A)
+        if disc < 0.0:
+            return None
+        root = math.sqrt(disc)
+        T = (dd + root) / (2.0 * A) if lob else 2.0 * (dz + A) / (dd + root)
+        return math.atan(T)
+
+    mortar = mkweapon("mortar", 200.0, 2.6, mv, 230.0)
+
+    # 8. Holding a mortar at range: it outranks the gun, and the pitch returned
+    #    must be a genuine arc that reaches the target -- matched against the
+    #    closed form above, so a mortar aimed like a gun fails this.
+    o = duel(900008, [gun0, mortar], 60.0, 100.0)
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    f = act.get("fire", [False, False])
+    out["mortar_fire"] = [bool(f[0]), bool(f[1])]
+    pitch = act.get("aim", [0.0, 0.0])[1]
+    cands = [p for p in (arc_pitch(o, 60.0, False), arc_pitch(o, 60.0, True)) if p is not None]
+    out["mortar_pitch_err"] = round(min(abs(pitch - p) for p in cands), 4) if cands else None
+    out["mortar_pass"] = bool(cands) and bool(f[1]) and not bool(f[0]) and \
+        out["mortar_pitch_err"] < 0.02
+
+    # 9. A target inside the mortar's own blast radius: must fall through to the
+    #    gun instead of shelling itself.
+    o = duel(900009, [gun0, mortar], 8.0, 100.0)
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    f = act.get("fire", [False, False])
+    out["mortar_close_fire"] = [bool(f[0]), bool(f[1])]
+    out["mortar_close_pass"] = bool(f[0]) and not bool(f[1])
+
+    # 10-12. Laser: hold to charge, release to fire. Idle and aligned it must
+    #    start charging; part-way it must keep holding; near full it must let go.
+    hold = []
+    for i, (chg, want) in enumerate(((0.0, True), (0.30, True), (0.90 * lc + 0.05, False))):
+        o = duel(900010 + i, [gun0, mkweapon("laser", 315.0, 1.65, 0.0, 280.0, charge=chg)],
+                 8.0, 100.0)
+        bot.send(o)
+        act = json.loads(bot.next_line())
+        f = act.get("fire", [False, False])
+        hold.append((round(chg, 3), bool(f[1]), want))
+    out["laser_charge_hold"] = hold
+    out["laser_pass"] = all(got == want for _, got, want in hold)
+
+    # 13. Out-gunned: six healthy weapons converging makes the trade unwinnable,
+    #     so it must hold fire entirely rather than shoot and lose.
+    o = duel(900013, [gun0], 60.0, 1400.0, extra_lasers=5)
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    f = act.get("fire", [False, False])
+    out["lose_fire"] = [bool(f[0]), bool(f[1])]
+    out["lose_pass"] = not bool(f[0]) and not bool(f[1])
+
     return out
 
 
@@ -417,13 +526,16 @@ def main():
                     if len(zone_examples) < 5:
                         zone_examples.append((o["tick"], round(math.dist((x, y), (cx, cy)), 1), round(cr, 1), round(dot, 2)))
 
-    syn = synthetic(bot, obs, g)
+    syn = synthetic(bot, obs, g, cfg)
     print("synthetic policy checks (paths the recorded stream never reaches):")
     for k in ("base_tick", "base_on_ground",
               "zone_run_dot", "zone_run_boost", "zone_run_pass", "take_id", "take_pass",
               "pick", "pick_pass", "wall_clearance", "wall_pass",
               "crate_aim_err", "crate_fire", "crate_approach", "crate_pass",
-              "cube_approach", "cube_pass", "cap_fire", "cap_pass"):
+              "cube_approach", "cube_pass", "cap_fire", "cap_pass",
+              "mortar_fire", "mortar_pitch_err", "mortar_pass",
+              "mortar_close_fire", "mortar_close_pass",
+              "laser_charge_hold", "laser_pass", "lose_fire", "lose_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")

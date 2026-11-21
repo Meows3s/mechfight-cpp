@@ -12,8 +12,12 @@ and `place` = the number of mechs alive (including you) at the moment you die.
 - Last alive: `place 1` -> **15 points**.
 - Survivors when the clock runs out are ranked by **HP**.
 
-So the score is *not* a combat score. It is "how many of the other 15 were
-already dead when I died", averaged. Placement beats kills, explicitly.
+So the score is exactly "how many of the other 15 were already dead when I
+died", averaged. That includes the ones we killed ourselves: `alive` counts
+every mech still standing, so each kill of ours moves our own place up by one at
+the moment we die. "Placement counts, not kills" means **do not die for a kill**
+— it does not mean kills are worthless. A kill is worth a place point plus the
+victim's cubes + 2, provided we live past it.
 
 Baseline to beat: **1.15** (the kit's Python example). That is roughly `place
 14.8` on average — the starter usually dies first or near-first against a
@@ -34,8 +38,14 @@ average placement is usually worth it.
 This is a 15v1 survival problem, not a free-for-all. Three consequences:
 
 1. **You are always the target.** There is no "let them fight each other".
-2. **Killing escalates the threat.** Thinning them out is what brings more of
-   them down on you. Early kills are actively harmful to placement.
+2. **Killing escalates the threat — but a kill is also a place point.** `alive`
+   counts every mech still standing, so anything we kill (like anything the zone
+   kills) is one more mech already dead when we die: worth exactly one place,
+   plus the victim's cubes. The countervailing cost is the squad committing more
+   bots to us ("more as you thin them out"). Those two channels pull opposite
+   ways and the net is **not measurable locally** — only a submitted practice run
+   will say which dominates. Hence the policy rule is "engage only when the trade
+   is predicted winnable", not "never engage".
 3. **"Weakest first" is a death spiral risk.** If the squad's notion of weakest
    is low HP, being hurt draws more attackers, which hurts you more. Keeping HP
    topped up (regen is 45/s after 5 s out of combat) is defensive *and*

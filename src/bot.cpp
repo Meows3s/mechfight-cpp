@@ -7,10 +7,17 @@
 //   3. farm power cubes (crates and NPC drones) while it is safe to do so --
 //      cubes are +4% max HP and +4% damage each up to 10, which is what decides
 //      the late brawl
-//   4. break off and fight only when an enemy is actually close
+//   4. take a fight only when the damage trade is predicted winnable, and then
+//      pick the cheapest kill going
 //   5. face whatever is shooting at us, so its fire lands in the front arc
 //      instead of the 1.5x rear arc
 //   6. shoot only with a clear shot, tested against the map
+//
+// Firing: both weapon slots shoot along the ONE torso aim, so a mortar and a
+// direct-fire gun can never be used on the same decision -- one of them would
+// always be mis-aimed. So a single active weapon is chosen per decision,
+// preferring mortar, then laser, then lightning, then the gun, among those
+// actually usable at that range.
 //
 // Everything reads live numbers from hello.config. The map is loaded once.
 #include "bot.hpp"
@@ -20,6 +27,7 @@
 #include <cstdint>
 #include <string>
 
+#include "ballistics.hpp"
 #include "map.hpp"
 
 namespace mech {
@@ -44,6 +52,13 @@ Vec2 rot(const Vec2& v, double ang) {
   return {v[0] * c - v[1] * s, v[0] * s + v[1] * c};
 }
 
+double angle_diff(double a, double b) {
+  double d = a - b;
+  while (d > kPi) d -= 2.0 * kPi;
+  while (d < -kPi) d += 2.0 * kPi;
+  return std::fabs(d);
+}
+
 // Lower rank = better. Unknown upgrades sink to the bottom.
 int upgrade_rank(const std::string& id) {
   static const char* kOrder[] = {"armor",  "plating", "servos",  "capacitor", "reactor",
@@ -55,6 +70,17 @@ int upgrade_rank(const std::string& id) {
 
 double weapon_range(const Weapon& w) { return w.range > 1.0 ? w.range : 230.0; }
 
+// hello.config["weapons"][w][k], or `d`.
+inline double cfgw(const mf::json& c, const char* w, const char* k, double d) {
+  const auto a = c.find("weapons");
+  if (a == c.end() || !a->is_object()) return d;
+  const auto b = a->find(w);
+  if (b == a->end() || !b->is_object()) return d;
+  const auto v = b->find(k);
+  if (v == b->end() || !v->is_number()) return d;
+  return v->get<double>();
+}
+
 class MechBot final : public Bot {
  public:
   explicit MechBot(const Hello& hello)
@@ -64,7 +90,26 @@ class MechBot final : public Bot {
         standoff_(hello.cfg("sound", "near", 60.0) + 20.0),
         cube_radius_(hello.cfg("cubes", "pickup_radius", 3.5)),
         crate_drop_(hello.cfg("crates", "height", 2.4) * 0.5),
+        dmg_per_cube_(hello.cfg("cubes", "damage_per_cube", 0.04)),
+        stat_cap_(hello.cfg("cubes", "stat_cap", 10.0)),
+        armor_(hello.cfg("mech", "armor", 0.0)),
+        mortar_gravity_(cfgw(hello.config, "mortar", "gravity", 22.0)),
+        splash_radius_(cfgw(hello.config, "mortar", "splash_radius", 7.0)),
+        lightning_cost_(cfgw(hello.config, "lightning", "energy", 3.0)),
+        laser_charge_max_(cfgw(hello.config, "laser", "charge", 0.75)),
+        mech_height_(hello.cfg("mech", "height", 9.0)),
+        mech_radius_(hello.cfg("mech", "radius", 2.5)),
         rng_(static_cast<std::uint32_t>(hello.seed) | 1u) {
+    for (int i = 0; i < 4; ++i) {
+      const char* n = weapon_name(static_cast<WeaponKind>(i));
+      wc_[i].damage = cfgw(hello.config, n, "damage", 0.0);
+      wc_[i].cd = cfgw(hello.config, n, "cooldown", 0.0);
+      wc_[i].range = cfgw(hello.config, n, "range", 0.0);
+      wc_[i].speed = cfgw(hello.config, n, "speed", 0.0);
+      wc_[i].mag = cfgw(hello.config, n, "mag", 0.0);
+      wc_[i].reload = cfgw(hello.config, n, "reload", 0.0);
+    }
+    mortar_min_range_ = splash_radius_ + 6.0;  // closer than this and we eat our own splash
     have_map_ = map_.load(hello.map_dir, hello.map_files);
     if (have_map_) {
       step_up_ = map_.rule_max_step();
@@ -81,8 +126,8 @@ class MechBot final : public Bot {
     const double dt = (last_t_ >= 0.0) ? std::max(0.0, o.t - last_t_) : 0.0;
     last_t_ = o.t;
 
-    mech_height_ = me.stat("height", 9.0);
-    mech_radius_ = me.stat("radius", 2.5);
+    mech_height_ = me.stat("height", mech_height_);
+    mech_radius_ = me.stat("radius", mech_radius_);
 
     take_upgrade(a, o);
     take_loot(a, o, me_xy);
@@ -95,21 +140,19 @@ class MechBot final : public Bot {
       }
     threat_age_ += dt;
 
-    const Vec3 m = muzzle(me);
     const Circle zone = predicted_zone(o);
     const double margin = mech_radius_ + 6.0;
     const bool settled = dist2(me_xy, zone.center) <= zone.radius - margin;
 
-    const Actor* enemy = nearest_mech(o, me_xy);
-    const double enemy_d = enemy ? dist3(m, centre(*enemy)) : 1e18;
-    const bool engage = enemy != nullptr && enemy_d <= kDefendRange;
+    // Cheapest kill first (low HP costs least to finish), and only committed to
+    // when the trade is predicted to go our way.
+    const Actor* enemy = pick_enemy(o, me);
+    const bool engage = enemy != nullptr && winnable(o, me, *enemy);
 
-    // Farm only when nothing is close enough to be a problem. Past the stat cap
-    // cubes still make the mech bigger with no damage or HP benefit, so stop.
     const Farm farm = (!engage && me.cubes < kCubeTarget) ? pick_farm(o, zone, margin) : Farm{};
 
     steer(a, o, me, me_xy, zone, settled, engage ? enemy : nullptr, farm);
-    aim_and_fire(a, me, enemy, farm);
+    shoot(a, me, engage ? enemy : nullptr, farm);
     draw(a, o, me, zone, engage ? enemy : nullptr, farm);
     return a;
   }
@@ -120,21 +163,46 @@ class MechBot final : public Bot {
     double radius = 0.0;
   };
 
-  // Something worth shooting for cubes.
+  struct WeaponCfg {
+    double damage = 0, cd = 0, range = 0, speed = 0, mag = 0, reload = 0;
+  };
+
   struct Farm {
     enum class Kind { None, Crate, Drone };
     Kind kind = Kind::None;
     const Actor* drone = nullptr;
     const Item* crate = nullptr;
-    Vec3 point{};  // where to aim
+    Vec3 point{};
     double dist = 1e18;
   };
 
-  static constexpr double kDefendRange = 110.0;  // engage an enemy inside this
-  static constexpr double kCubeTarget = 10.0;    // cubes.cap: HP and damage stop here
-  static constexpr double kFarmRadius = 110.0;   // how far to detour for cubes
+  struct Shot {
+    bool valid = false;
+    int slot = -1;
+    bool fire = false;
+    Vec2 aim{};
+    double dist = 1e18;
+  };
+
+  static constexpr double kCubeTarget = 10.0;   // cubes.stat_cap: HP/damage stop here
+  static constexpr double kFarmRadius = 110.0;  // how far to detour for cubes
+  static constexpr double kWinMargin = 1.35;    // demand to win by this much to engage
+  static constexpr double kAligned = 0.14;      // rad: "the torso is on the target"
+  static constexpr double kThreatRange = 300.0; // beyond this nobody can be shooting us
 
   // ---------------------------------------------------------------- geometry
+
+  static int wi(WeaponKind k) { return static_cast<int>(k); }
+
+  static int weapon_pref(WeaponKind k) {
+    switch (k) {
+      case WeaponKind::Mortar: return 0;
+      case WeaponKind::Laser: return 1;
+      case WeaponKind::Lightning: return 2;
+      case WeaponKind::Gun: return 3;
+    }
+    return 3;
+  }
 
   static Vec3 muzzle(const Self& me) {
     return {me.pos[0], me.pos[1], me.pos[2] + me.muzzle_height()};
@@ -155,9 +223,6 @@ class MechBot final : public Bot {
     return rng_;
   }
 
-  // Where the zone circle will be `lookahead_` seconds from now. The circle
-  // moves linearly from the current one to the next between shrink_start and
-  // shrink_end, so this is exact rather than a guess.
   Circle predicted_zone(const Obs& o) const {
     const Zone& z = o.zone;
     double u = 0.0;
@@ -170,11 +235,60 @@ class MechBot final : public Bot {
     return c;
   }
 
-  // Crates on rooftops are unreachable without a climb; skip anything sitting
-  // well above the ground under it.
   bool reachable(const Vec3& pos) const {
     if (!have_map_) return true;
     return pos[2] - map_.terrain_h(pos[0], pos[1]) <= 3.0;
+  }
+
+  // ---------------------------------------------------------------- damage model
+
+  double cube_mult(double cubes) const {
+    return 1.0 + dmg_per_cube_ * std::min(std::max(0.0, cubes), stat_cap_);
+  }
+
+  // Sustained damage per second. Taking raw damage/cooldown flatters both the
+  // gun (reload downtime) and the laser (charge time), so amortise each.
+  static double sustained_dps(double damage, double cd, double extra) {
+    if (damage <= 0.0 || cd <= 0.0) return 0.0;
+    return damage / (cd + extra);
+  }
+
+  double our_dps(const Self& me) const {
+    const double mult = cube_mult(me.cubes);
+    double dps = 0.0;
+    for (int i = 0; i < 2; ++i) {
+      if (!me.has_weapon[i]) continue;
+      const Weapon& w = me.weapons[i];
+      double extra = 0.0;
+      if (w.kind == WeaponKind::Gun && w.mag > 0.0 && w.reload_s > 0.0)
+        extra = w.reload_s * w.cd / w.mag;  // reload amortised across the magazine
+      else if (w.kind == WeaponKind::Laser)
+        extra = laser_charge_max_;
+      dps += sustained_dps(w.damage, w.cd, extra) * mult;
+    }
+    return dps;
+  }
+
+  // Their loadout is visible only as weapon kinds, so use stock config numbers
+  // scaled by their cubes. Unknown armour is assumed to be none.
+  double enemy_dps(const Actor& a) const {
+    const double mult = cube_mult(a.cubes);
+    double dps = 0.0;
+    for (WeaponKind k : a.weapons) {
+      const WeaponCfg& c = wc_[wi(k)];
+      double extra = 0.0;
+      if (k == WeaponKind::Gun && c.mag > 0.0 && c.reload > 0.0)
+        extra = c.reload * c.cd / c.mag;
+      else if (k == WeaponKind::Laser)
+        extra = laser_charge_max_;
+      dps += sustained_dps(c.damage, c.cd, extra) * mult;
+    }
+    if (dps <= 0.0) {
+      const WeaponCfg& g = wc_[wi(WeaponKind::Gun)];
+      const double extra = (g.mag > 0.0 && g.cd > 0.0) ? g.reload * g.cd / g.mag : 0.0;
+      dps = sustained_dps(g.damage, g.cd, extra) * mult;
+    }
+    return dps;
   }
 
   // ---------------------------------------------------------------- decisions
@@ -192,38 +306,86 @@ class MechBot final : public Bot {
     a.pick = best;
   }
 
-  void take_loot(Action& a, const Obs& o, const Vec2& me_xy) const {
-    if (o.self.has_weapon[1]) return;
-    int want = -1;
-    double best = pickup_radius_;
+  // Best weapon pickup within `radius`, by the mortar > laser > lightning
+  // preference and then by distance. Only worth taking if it beats what slot 1
+  // already holds; holding the same kind twice is illegal anyway.
+  const Pickup* best_pickup(const Obs& o, const Vec2& me_xy, double radius, const Circle* zone,
+                            double margin) const {
+    int held = 999;
+    if (o.self.has_weapon[1]) held = weapon_pref(o.self.weapons[1].kind);
+    const Pickup* best = nullptr;
+    int best_pref = 999;
+    double best_d = 1e18;
     for (const auto& p : o.pickups) {
       if (p.kind == WeaponKind::Gun) continue;  // never swap the gun out
+      const int pr = weapon_pref(p.kind);
+      if (pr >= held) continue;                 // no upgrade over what we hold
       const double d = dist2(xy(p.pos), me_xy);
-      if (d <= best) {
-        best = d;
-        want = p.id;
-      }
-    }
-    if (want >= 0) a.take_id = want;
-  }
-
-  const Actor* nearest_mech(const Obs& o, const Vec2& me_xy) const {
-    const Actor* best = nullptr;
-    double best_d = 1e18;
-    for (const auto& m : o.mechs) {
-      if (m.npc) continue;
-      const double d = dist2(xy(m.pos), me_xy);
-      if (d < best_d) {
+      if (d > radius) continue;
+      if (zone && dist2(xy(p.pos), zone->center) > zone->radius - margin) continue;
+      if (pr < best_pref || (pr == best_pref && d < best_d)) {
+        best_pref = pr;
         best_d = d;
-        best = &m;
+        best = &p;
       }
     }
     return best;
   }
 
-  // Best cube source: closest per unit value, inside the circle we are heading
-  // to, on reachable ground. A drone drops 2 cubes but shoots back, and a crate
-  // can drop the weapon for our empty slot, so the weights are not just cubes.
+  void take_loot(Action& a, const Obs& o, const Vec2& me_xy) const {
+    const Pickup* p = best_pickup(o, me_xy, pickup_radius_, nullptr, 0.0);
+    if (!p) return;
+    a.take_id = p->id;
+    // Slot 1 is occupied, so this is a swap: name the slot being replaced.
+    if (o.self.has_weapon[1]) a.drop_slot = 1;
+  }
+
+  // Least expensive kill that is actually in range: estimated time for us to
+  // finish it, with a mild penalty for distance.
+  const Actor* pick_enemy(const Obs& o, const Self& me) const {
+    const double dps = our_dps(me);
+    if (dps <= 0.0) return nullptr;
+    double reach = 0.0;
+    for (int i = 0; i < 2; ++i)
+      if (me.has_weapon[i]) reach = std::max(reach, weapon_range(me.weapons[i]));
+    const Vec3 m = muzzle(me);
+    const Actor* best = nullptr;
+    double best_score = 1e18;
+    for (const auto& a : o.mechs) {
+      if (a.npc) continue;
+      const double d = dist3(m, centre(a));
+      if (d > reach) continue;
+      const double hp = a.hp > 0.0 ? a.hp : (a.max_hp > 0.0 ? a.max_hp : 1400.0);
+      const double score = (hp / dps) * (1.0 + d / 600.0);
+      if (score < best_score) {
+        best_score = score;
+        best = &a;
+      }
+    }
+    return best;
+  }
+
+  // Do we finish them before they -- and everyone else who can see us -- finish
+  // us? Every visible mech in range counts as incoming, because the squad
+  // shares vision and will converge.
+  bool winnable(const Obs& o, const Self& me, const Actor& target) const {
+    const double dps = our_dps(me);
+    if (dps <= 0.0) return false;
+    const double their_hp = target.hp > 0.0 ? target.hp : 1400.0;
+    const double ttk_us = their_hp / dps;
+
+    const Vec3 m = muzzle(me);
+    double incoming = 0.0;
+    for (const auto& a : o.mechs) {
+      if (a.npc) continue;
+      if (dist3(m, centre(a)) > kThreatRange) continue;
+      incoming += enemy_dps(a);
+    }
+    incoming *= (1.0 - std::clamp(armor_, 0.0, 0.9));
+    const double ttk_them = me.hp / std::max(1e-6, incoming);
+    return ttk_us * kWinMargin < ttk_them;
+  }
+
   Farm pick_farm(const Obs& o, const Circle& zone, double margin) const {
     const bool want_weapon = !o.self.has_weapon[1];
     const Vec3 m = muzzle(o.self);
@@ -233,7 +395,7 @@ class MechBot final : public Bot {
     auto consider = [&](Farm::Kind kind, const Actor* drone, const Item* crate, const Vec3& aim,
                         double value) {
       if (!reachable(aim)) return;
-      if (dist2(xy(aim), zone.center) > zone.radius - margin) return;  // outside where we must be
+      if (dist2(xy(aim), zone.center) > zone.radius - margin) return;
       const double d = dist3(m, aim);
       if (d > kFarmRadius) return;
       const double score = d / value;
@@ -290,8 +452,7 @@ class MechBot final : public Bot {
       return;
     }
 
-    // A cube already on the ground is free: it only needs walking over. This
-    // outranks everything except the zone itself.
+    // A cube already on the ground is free: it only needs walking over.
     if (const Item* cube = nearest_cube(o, me_xy, zone)) {
       a.move = avoid(me.pos, norm_or({cube->pos[0] - me_xy[0], cube->pos[1] - me_xy[1]},
                                      {1.0, 0.0}),
@@ -299,7 +460,7 @@ class MechBot final : public Bot {
       return;
     }
 
-    if (const Pickup* loot = want_loot(o, zone, me_xy)) {
+    if (const Pickup* loot = best_pickup(o, me_xy, 60.0, &zone, mech_radius_ + 6.0)) {
       a.move = avoid(me.pos, norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]},
                                      {1.0, 0.0}),
                      12.0);
@@ -326,8 +487,8 @@ class MechBot final : public Bot {
     }
 
     if (farm.kind != Farm::Kind::None) {
-      a.move = avoid(me.pos, norm_or({farm.point[0] - me_xy[0], farm.point[1] - me_xy[1]},
-                                     {1.0, 0.0}),
+      a.move = avoid(me.pos,
+                     norm_or({farm.point[0] - me_xy[0], farm.point[1] - me_xy[1]}, {1.0, 0.0}),
                      12.0);
       return;
     }
@@ -352,79 +513,147 @@ class MechBot final : public Bot {
     return best;
   }
 
-  const Pickup* want_loot(const Obs& o, const Circle& zone, const Vec2& me_xy) const {
-    if (o.self.has_weapon[1]) return nullptr;
-    const Pickup* best = nullptr;
-    double best_d = 60.0;
-    const double margin = mech_radius_ + 6.0;
-    for (const auto& p : o.pickups) {
-      if (p.kind == WeaponKind::Gun) continue;
-      if (dist2(xy(p.pos), zone.center) > zone.radius - margin) continue;
-      const double d = dist2(xy(p.pos), me_xy);
-      if (d < best_d) {
-        best_d = d;
-        best = &p;
-      }
-    }
-    return best;
+  // ---------------------------------------------------------------- shooting
+
+  static Vec2 aim_at(const Vec3& m, const Vec3& p) {
+    const double hd = hypot2(p[0] - m[0], p[1] - m[1]);
+    return {std::atan2(p[1] - m[1], p[0] - m[0]), std::atan2(p[2] - m[2], hd)};
   }
 
-  // ---------------------------------------------------------------- aiming
+  // Mortar: solve the launch pitch, iterating on time-of-flight so the shell
+  // lands where the target will be. Prefers the flat arc, but lobs over the top
+  // when a building is in the way -- which is what a mortar is for.
+  bool mortar_aim(const Vec3& m, const Vec3& pt, const Vec3& vel, bool leadable, Vec2& aim) const {
+    const WeaponCfg& mc = wc_[wi(WeaponKind::Mortar)];
+    const double v = mc.speed > 1.0 ? mc.speed : 72.0;
+    const double g = mortar_gravity_;
+    Vec3 t = pt;
+    double pitch = 0.0;
+    for (int it = 0; it < 3; ++it) {
+      const double dx = t[0] - m[0], dy = t[1] - m[1], dz = t[2] - m[2];
+      const double d = hypot2(dx, dy);
+      if (d < 1.0) return false;
+      double flat = 0.0, lob = 0.0;
+      const bool has_flat =
+          solve_pitch(d, dz, v, g, false, flat) && flat >= min_pitch_ && flat <= max_pitch_;
+      const bool has_lob =
+          solve_pitch(d, dz, v, g, true, lob) && lob >= min_pitch_ && lob <= max_pitch_;
+      const bool straight = !have_map_ || map_.shot_los(m, t);
+      if (has_flat && straight) {
+        pitch = flat;
+      } else if (has_lob) {
+        pitch = lob;  // over the top
+      } else if (has_flat) {
+        pitch = flat;
+      } else {
+        return false;
+      }
+      if (!leadable) break;
+      const double tof = d / (v * std::cos(pitch));
+      t = {pt[0] + vel[0] * tof, pt[1] + vel[1] * tof, pt[2] + vel[2] * tof};
+    }
+    aim = {std::atan2(t[1] - m[1], t[0] - m[0]), pitch};
+    return true;
+  }
 
-  void aim_and_fire(Action& a, const Self& me, const Actor* enemy, const Farm& farm) const {
+  // Hold to charge, let go to fire. Releasing fires the beam wherever we happen
+  // to be pointing, so once charging we are committed: hold until the torso is
+  // on the target and the charge is nearly full.
+  bool laser_trigger(const Weapon& w, const Self& me, bool aligned) const {
+    (void)me;
+    if (w.charge <= 0.0) return aligned;                     // start only when on target
+    if (w.charge >= laser_charge_max_ * 0.90) return false;  // let go: near-full beam
+    return true;                                             // already committed; keep charging
+  }
+
+  Shot plan_shot(const Self& me, const Vec3& pt, const Vec3& vel, bool leadable,
+                 bool allow_fire) const {
+    Shot s;
     const Vec3 m = muzzle(me);
-    const double enemy_d = enemy ? dist3(m, centre(*enemy)) : 1e18;
+    for (int slot = 0; slot < 2; ++slot) {
+      if (!me.has_weapon[slot]) continue;
+      const Weapon& w = me.weapons[slot];
+      const double d = dist3(m, pt);
+      const bool los = !have_map_ || map_.shot_los(m, pt);
+      Vec2 aim{};
+      bool fire = false;
 
-    // What to shoot: an enemy that is actually close, otherwise the farm
-    // target, otherwise the distant enemy, otherwise nothing.
+      switch (w.kind) {
+        case WeaponKind::Gun: {
+          if (d > weapon_range(w)) continue;
+          const double sp = w.speed > 1.0 ? w.speed : 252.0;
+          const double tof = leadable ? d / sp : 0.0;
+          aim = aim_at(m, Vec3{pt[0] + vel[0] * tof, pt[1] + vel[1] * tof, pt[2] + vel[2] * tof});
+          fire = los;
+          break;
+        }
+        case WeaponKind::Lightning: {
+          if (d > weapon_range(w) || me.energy < lightning_cost_) continue;
+          aim = aim_at(m, pt);  // instant along the aim: no lead
+          fire = los;
+          break;
+        }
+        case WeaponKind::Laser: {
+          if (d > weapon_range(w)) continue;
+          aim = aim_at(m, pt);  // hitscan: no lead
+          fire = laser_trigger(w, me, los && angle_diff(me.aim[0], aim[0]) < kAligned);
+          break;
+        }
+        case WeaponKind::Mortar: {
+          if (d < mortar_min_range_) continue;  // this close, its own splash hits us
+          if (!mortar_aim(m, pt, vel, leadable, aim)) continue;
+          fire = true;
+          break;
+        }
+      }
+      fire = fire && allow_fire;
+      if (!s.valid || weapon_pref(w.kind) < weapon_pref(me.weapons[s.slot].kind)) {
+        s.valid = true;
+        s.slot = slot;
+        s.fire = fire;
+        s.aim = aim;
+        s.dist = d;
+      }
+    }
+    return s;
+  }
+
+  void shoot(Action& a, const Self& me, const Actor* enemy, const Farm& farm) const {
     Vec3 pt{};
     Vec3 vel{0.0, 0.0, 0.0};
-    bool lead = false;
-    double d = 1e18;
-    if (enemy && enemy_d <= kDefendRange) {
+    bool leadable = false;
+    bool allow_fire = false;
+
+    if (enemy) {
       pt = centre(*enemy);
       vel = enemy->vel;
-      lead = true;
-      d = enemy_d;
+      leadable = true;
+      allow_fire = true;
     } else if (farm.kind != Farm::Kind::None) {
       pt = farm.point;
-      d = farm.dist;
       if (farm.drone) {
         vel = farm.drone->vel;
-        lead = true;
+        leadable = true;
       }
-    } else if (enemy) {
-      pt = centre(*enemy);
-      vel = enemy->vel;
-      lead = true;
-      d = enemy_d;
+      allow_fire = true;
     } else {
       a.aim = (threat_age_ < 4.0) ? Vec2{threat_bearing_, me.aim[1]} : me.aim;
       return;
     }
 
-    const double speed =
-        (me.has_weapon[0] && me.weapons[0].speed > 1.0) ? me.weapons[0].speed : 252.0;
-    const double tof = lead ? d / speed : 0.0;
-    const double px = pt[0] + vel[0] * tof;
-    const double py = pt[1] + vel[1] * tof;
-    const double pz = pt[2] + vel[2] * tof;
-    const double hd = hypot2(px - m[0], py - m[1]);
-    double pitch = std::atan2(pz - m[2], hd);
-    pitch = std::clamp(pitch, min_pitch_, max_pitch_);
-    a.aim = {std::atan2(py - m[1], px - m[0]), pitch};
-
-    // Slot 0: the arm gun. Fire inside range, and only with a clear shot.
-    if (me.has_weapon[0]) {
-      const Weapon& w = me.weapons[0];
-      const bool los = !have_map_ || map_.shot_los(m, pt);
-      a.fire[0] = los && d <= weapon_range(w);
-      if (w.kind == WeaponKind::Gun && w.ammo <= 0.0 && w.reload <= 0.0) a.reload = true;
+    const Shot s = plan_shot(me, pt, vel, leadable, allow_fire);
+    if (!s.valid) {
+      // Nothing can be brought to bear (out of range, or no line). Still point
+      // the torso at it, so incoming fire meets the front arc rather than the back.
+      Vec2 aim = aim_at(muzzle(me), pt);
+      aim[1] = std::clamp(aim[1], min_pitch_, max_pitch_);
+      a.aim = aim;
+      return;
     }
-    // Slot 1: only the lightning is safe to hold. Laser and mortar need real
-    // charge/arc handling, which is still outstanding.
-    if (me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Lightning)
-      a.fire[1] = d <= weapon_range(me.weapons[1]);
+    a.aim = s.aim;
+    a.fire[s.slot] = s.fire;
+    const Weapon& w = me.weapons[s.slot];
+    if (w.kind == WeaponKind::Gun && w.ammo <= 0.0 && w.reload <= 0.0) a.reload = true;
   }
 
   // ---------------------------------------------------------------- drawing
@@ -448,15 +677,19 @@ class MechBot final : public Bot {
     const char* mode = farm.kind == Farm::Kind::Drone ? "drone"
                        : farm.kind == Farm::Kind::Crate ? "crate"
                                                         : "";
+    const char* held = me.has_weapon[1] ? weapon_name(me.weapons[1].kind) : "-";
     a.draw.label("hp " + std::to_string(static_cast<int>(me.hp)) + " c" +
                  std::to_string(static_cast<int>(me.cubes)) + "/" +
                  std::to_string(static_cast<int>(kCubeTarget)) + " z" +
                  std::to_string(static_cast<int>(zone.radius)) + " a" +
-                 std::to_string(o.alive) + " " + mode + (have_map_ ? "" : " NOMAP"));
+                 std::to_string(o.alive) + " " + held + " " + mode +
+                 (have_map_ ? "" : " NOMAP"));
   }
 
   Map map_;
   bool have_map_ = false;
+
+  WeaponCfg wc_[4];
 
   double pickup_radius_;
   double min_pitch_;
@@ -464,6 +697,14 @@ class MechBot final : public Bot {
   double standoff_;
   double cube_radius_;
   double crate_drop_;
+  double dmg_per_cube_;
+  double stat_cap_;
+  double armor_;
+  double mortar_gravity_;
+  double splash_radius_;
+  double mortar_min_range_ = 13.0;
+  double lightning_cost_;
+  double laser_charge_max_;
   double mech_height_ = 9.0;
   double mech_radius_ = 2.5;
   double step_up_ = 1.5;
