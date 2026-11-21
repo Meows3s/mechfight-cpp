@@ -98,6 +98,7 @@ static Weapon parse_weapon(const json& w) {
     out.spread_deg = num(*s, "spread_deg");
     out.mag = num(*s, "mag");
     out.reload_s = num(*s, "reload");
+    out.max_charge = num(*s, "charge");
   }
   return out;
 }

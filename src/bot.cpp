@@ -251,12 +251,14 @@ class MechBot final : public Bot {
                      12.0);
       a.boost = !me.in_zone && dist2(me_xy, zone.center) > 25.0;
       hide_state_ = 0;
-    } else if (!mortar_armed && !under_fire) {
-      // ARM / UPGRADE TO MORTAR. best_pickup ranks mortar > laser > lightning
-      // and finds nothing once a mortar is held. Unarmed we search 180 m;
-      // holding laser/lightning we still detour up to 95 m for a mortar swap.
+    } else if (!under_fire && !enemy) {
+      // ARM / UPGRADE TO MORTAR / COLLECT FREE CUBES.
+      // Previously this block was gated on !mortar_armed, which meant once we
+      // held a mortar we never walked over to pick up loose cubes from crates
+      // we popped or enemies we shelled.
       const double loot_r = need_weapon ? 180.0 : 95.0;
-      if (const Pickup* loot = best_pickup(o, me_xy, loot_r, &zone, margin)) {
+      const Pickup* loot = !mortar_armed ? best_pickup(o, me_xy, loot_r, &zone, margin) : nullptr;
+      if (loot) {
         a.move = avoid(me.pos,
                        norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]},
                                {1.0, 0.0}),
@@ -380,6 +382,18 @@ class MechBot final : public Bot {
       if (exposed_shot) a.boost = true;
     }
     dodge_hazards(a, o, me, me_xy);
+    // Reload when empty, or top off a partial gun magazine while out of
+    // combat so we never enter the next engagement with 2 rounds left.
+    for (int slot = 0; slot < 2; ++slot) {
+      if (!me.has_weapon[slot] || me.weapons[slot].kind != WeaponKind::Gun) continue;
+      const Weapon& w = me.weapons[slot];
+      if (w.reload > 0.0 || w.ammo < 0.0) continue;
+      const double mag = w.mag > 0.0 ? w.mag : 12.0;
+      if (w.ammo <= 0.0 || (!under_fire && !enemy && crate_farm.kind == Farm::Kind::None &&
+                            w.ammo < mag * 0.75)) {
+        a.reload = true;
+      }
+    }
     draw(a, o, me, zone, enemy, Farm{});
     return a;
   }
@@ -1194,7 +1208,29 @@ class MechBot final : public Bot {
       }
       if (!leadable || it == 3) break;
       const double tof = d / (v * std::cos(pitch));
-      t = {pt[0] + vel[0] * tof, pt[1] + vel[1] * tof, pt[2] + vel[2] * tof};
+      // Cap the velocity-lead horizon at 2.2 s (so 6 s high lobs do not
+      // extrapolate 70 m across the map), clamp the leaded xy before any
+      // building wall it would enter (otherwise a target walking near a wall
+      // pushes `t` inside the prism and makes arc_clear reject the shot!),
+      // and keep z on the surface rather than extrapolating jump vel[2] 40 m
+      // into the sky.
+      const double lead_t = std::min(tof, 2.2);
+      double lx = pt[0], ly = pt[1];
+      const double z_off = have_map_ ? (pt[2] - map_.terrain_h(pt[0], pt[1])) : 4.5;
+      for (int s = 1; s <= 4; ++s) {
+        const double u = 0.25 * s;
+        const double nx = pt[0] + vel[0] * lead_t * u;
+        const double ny = pt[1] + vel[1] * lead_t * u;
+        if (have_map_) {
+          if (!map_.in_bounds(nx, ny)) break;
+          const double nz = map_.terrain_h(nx, ny);
+          if (map_.prism_blocks(nx, ny, nz + 0.2, nz + mech_height_)) break;
+        }
+        lx = nx;
+        ly = ny;
+      }
+      const double lz = have_map_ ? (map_.terrain_h(lx, ly) + std::clamp(z_off, 2.0, 8.0)) : pt[2];
+      t = {lx, ly, lz};
     }
     aim = {yaw, pitch};
     return true;
@@ -1205,9 +1241,10 @@ class MechBot final : public Bot {
   // on the target and the charge is nearly full.
   bool laser_trigger(const Weapon& w, const Self& me, bool aligned) const {
     (void)me;
-    if (w.charge <= 0.0) return aligned;                        // start only when on target
-    if (w.charge >= laser_charge_max_ * 0.90) return !aligned;  // hold up to hold_s until aligned
-    return true;                                                // already committed; keep charging
+    if (w.charge <= 0.0) return aligned;  // start only when on target
+    const double cap = w.max_charge > 0.05 ? w.max_charge : laser_charge_max_;
+    if (w.charge >= cap * 0.90) return !aligned;  // hold up to hold_s until aligned
+    return true;                                  // already committed; keep charging
   }
 
   Shot plan_shot(const Self& me, const Vec3& pt, const Vec3& vel, bool leadable,

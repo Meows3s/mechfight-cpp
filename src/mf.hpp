@@ -36,7 +36,7 @@ struct Weapon {
   double charge = -1.0;   // laser only: seconds charged so far
   // this weapon's numbers after your upgrades
   double damage = 0.0, cd = 0.0, speed = 0.0, range = 0.0;
-  double spread_deg = 0.0, mag = 0.0, reload_s = 0.0;
+  double spread_deg = 0.0, mag = 0.0, reload_s = 0.0, max_charge = 0.0;
 };
 
 struct Actor {  // another mech (npc == false) or an NPC drone
