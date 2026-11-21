@@ -803,6 +803,23 @@ def synthetic(bot, obs, g, cfg):
     out["ambush_pass"] = (out["ambush_aim_err"] < 0.02 and out["ambush_move"] > 0.5
                           and out["ambush_boost"])
 
+    # 27. Flee direction when the enemy is between us and the zone centre:
+    #     at (-200, 0) with the enemy at (-120, 0) (east of us, toward zone
+    #     centre (0, 0)) while hurt, steer_hide must NOT pick a spot on the
+    #     far east side of the enemy and run through them -- must move west.
+    o = duel(900027, [gun0], 80.0, 1400.0, hot=True)
+    o["t"] = 200.0
+    o["self"]["hp"] = 400.0
+    o["self"]["pos"] = [-200.0, 0.0, g.terrain_h(-200.0, 0.0)]
+    o["mechs"][0]["pos"] = [-120.0, 0.0, g.terrain_h(-120.0, 0.0)]
+    o["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 230.0, "dps": 20.0}
+    bot.send(o)
+    act_fl = json.loads(bot.next_line())
+    mv_fl = act_fl.get("move", [0.0, 0.0])
+    out["flee_west"] = round(mv_fl[0] / max(1e-9, math.hypot(*mv_fl)), 3)
+    out["flee_away_pass"] = out["flee_west"] < 0.0
+
     return out
 
 
@@ -946,7 +963,8 @@ def main():
               "dodge_boost", "dodge_pass",
               "mortar_mem_boost", "mortar_mem_pass",
               "laser_juke_perp", "laser_juke_boost", "laser_juke_pass",
-              "ambush_aim_err", "ambush_move", "ambush_boost", "ambush_pass"):
+              "ambush_aim_err", "ambush_move", "ambush_boost", "ambush_pass",
+              "flee_west", "flee_away_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")

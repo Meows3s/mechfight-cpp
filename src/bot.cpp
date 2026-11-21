@@ -322,7 +322,8 @@ class MechBot final : public Bot {
         me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Laser && me.weapons[1].charge > 0.0;
     const Actor* fire_enemy =
         (under_fire || laser_charging || (mortar_armed && enemy)) ? enemy : nullptr;
-    const Farm crate_farm = (!fire_enemy && me.has_weapon[1] && !enemy && !spotter &&
+    const bool can_pop_crate = me.has_weapon[1] || (hide_state_ == 1 && o.pickups.empty());
+    const Farm crate_farm = (!fire_enemy && can_pop_crate && !enemy && !spotter &&
                              !under_fire && me.cubes < kCubeTarget)
                                 ? pick_safe_crate(o, me, zone, margin)
                                 : Farm{};
@@ -949,11 +950,22 @@ class MechBot final : public Bot {
       if (dc > zone.radius - margin) continue;
       double rank = s.cover * 300.0 - 0.2 * dc - 0.1 * hypot2(s.x - me_xy[0], s.y - me_xy[1]);
       if (s.x == hide_tx_ && s.y == hide_ty_) rank += 25.0;  // stickiness
-      if (spotter)
+      if (spotter) {
         // When someone has seen us, opening the range dominates cover quality:
         // the best-covered spot 60 m from their muzzles is still 60 m from
-        // their muzzles. Up to 375 rank points of separation.
+        // their muzzles. Up to 375 rank points of separation -- and penalize
+        // spots that lie IN the direction of the spotter so we never run
+        // through the enemy to reach a spot on their far side.
         rank += std::min(hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]), 250.0) * 1.5;
+        const double d_me = hypot2(s.x - me_xy[0], s.y - me_xy[1]);
+        const double d_sp = hypot2(spotter->pos[0] - me_xy[0], spotter->pos[1] - me_xy[1]);
+        if (d_me > 4.0 && d_sp > 1.0) {
+          const double cos_sp = ((s.x - me_xy[0]) * (spotter->pos[0] - me_xy[0]) +
+                                 (s.y - me_xy[1]) * (spotter->pos[1] - me_xy[1])) /
+                                (d_me * d_sp);
+          rank -= 220.0 * cos_sp;
+        }
+      }
       if (rank > best_rank) {
         best_rank = rank;
         best = &s;
