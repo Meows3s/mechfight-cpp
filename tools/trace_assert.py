@@ -516,7 +516,7 @@ def synthetic(bot, obs, g, cfg):
             math.hypot(*mv) < 0.05
 
     # 17. A tower past the tank's reach must NOT be targeted: better to ignore
-    #     the crate than to fly at a wall and fall off halfway.
+    # the crate than to fly at a wall and fall off halfway.
     tower = find_tower()
     out["tower_found"] = tower is not None
     if tower and roof:
@@ -530,6 +530,32 @@ def synthetic(bot, obs, g, cfg):
         out["tower_climb_m"] = round(ttop - g.terrain_h(tx, ty), 1)
         out["tower_jump"] = bool(act.get("jump"))
         out["tower_pass"] = not bool(act.get("jump"))
+
+    # 18. Unarmed with a laser 120 m east -- past the old 60 m search radius.
+    #     Slot 1 nearly doubles return-fire damage (gun 156 -> gun+laser 287
+    #     dps), and every kill is a place point, so the walk must be worth it.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900018
+    o["t"] = 100.0
+    o["mechs"] = []
+    o["offer"] = None
+    o["events"] = []
+    o["cubes"] = []
+    o["crates"] = []
+    o["self"]["cubes"] = 0
+    o["self"]["in_zone"] = True
+    o["self"]["weapons"] = [o["self"]["weapons"][0], None]
+    x, y, z = o["self"]["pos"]
+    o["zone"] = {"center": [x, y], "radius": 600.0, "next_center": [x, y],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
+    o["pickups"] = [{"id": 8200, "kind": "laser",
+                     "pos": [x + 120.0, y, g.terrain_h(x + 120.0, y)]}]
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    mv = act.get("move", [0.0, 0.0])
+    east = mv[0] / max(1e-9, math.hypot(*mv))
+    out["arm_east"] = round(east, 3)
+    out["arm_pass"] = east > 0.6
 
     return out
 
@@ -667,7 +693,8 @@ def main():
               "roof_found", "roof_climb_m", "roof_approach", "roof_jump", "roof_su_pass",
               "roof_pass", "roof_air_boost", "roof_air_pass",
               "roof_low_energy", "roof_low_pass",
-              "tower_found", "tower_climb_m", "tower_jump", "tower_pass"):
+              "tower_found", "tower_climb_m", "tower_jump", "tower_pass",
+              "arm_east", "arm_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")

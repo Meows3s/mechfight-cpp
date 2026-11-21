@@ -181,6 +181,16 @@ class MechBot final : public Bot {
     // sensibly still died first. The line-of-sight gate inside shoot() still
     // stops us wasting rounds into walls.
     shoot(a, me, enemy, farm);
+    // Sprint while someone actually has a shot line on us and the trade is not
+    // winnable. Boost is 19.5 m/s against a hunter's 11.7, so a few seconds of
+    // it opens ~47 m they must re-close while buildings keep breaking their
+    // line -- and it costs no aim and no shots. In the air boost *is* the jet,
+    // so only ever sprint grounded.
+    if (!engage && enemy && have_map_ && me.grounded &&
+        map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},  // muzzle_height
+                      {me.pos[0], me.pos[1], me.pos[2] + 4.5})) {
+      a.boost = true;
+    }
     draw(a, o, me, zone, enemy, farm);
     return a;
   }
@@ -549,16 +559,23 @@ class MechBot final : public Bot {
       return;
     }
 
-    // A cube already on the ground is free: it only needs walking over.
-    if (const Item* cube = nearest_cube(o, me_xy, zone)) {
-      a.move = avoid(me.pos, norm_or({cube->pos[0] - me_xy[0], cube->pos[1] - me_xy[1]},
+    // An empty slot 1 is the biggest single upgrade on the board: a second
+    // weapon nearly doubles return-fire damage (gun 156 -> gun+laser 287 dps,
+    // the same as a hunter), and every kill is a place point plus the victim's
+    // cubes. So while unarmed, search far and take the weapon before free
+    // cubes -- +4% stats is not worth a fraction of +84% damage. Armed, a
+    // swap is only worth a short opportunistic detour.
+    if (const Pickup* loot = best_pickup(o, me_xy, me.has_weapon[1] ? 60.0 : 180.0,
+                                         &zone, mech_radius_ + 6.0)) {
+      a.move = avoid(me.pos, norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]},
                                      {1.0, 0.0}),
                      12.0);
       return;
     }
 
-    if (const Pickup* loot = best_pickup(o, me_xy, 60.0, &zone, mech_radius_ + 6.0)) {
-      a.move = avoid(me.pos, norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]},
+    // A cube already on the ground is free: it only needs walking over.
+    if (const Item* cube = nearest_cube(o, me_xy, zone)) {
+      a.move = avoid(me.pos, norm_or({cube->pos[0] - me_xy[0], cube->pos[1] - me_xy[1]},
                                      {1.0, 0.0}),
                      12.0);
       return;
