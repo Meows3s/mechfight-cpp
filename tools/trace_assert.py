@@ -710,6 +710,68 @@ def synthetic(bot, obs, g, cfg):
     out["dodge_boost"] = bool(act.get("boost"))
     out["dodge_pass"] = out["dodge_boost"]
 
+    # 24. Persistent mortar impact memory: a high-lob shell seen at t=170.0
+    #     that will land on (x, y) 3.5 s later (past the old 2.6 s horizon!)
+    #     vanishes from obs.projectiles at t=170.2 when our torso turns away.
+    #     The bot must still remember the blast zone at t=170.2 and boost out.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900024
+    o["t"] = 170.0
+    o["mechs"] = []
+    o["offer"] = None
+    o["events"] = []
+    o["cubes"] = []
+    o["crates"] = []
+    o["pickups"] = []
+    o["self"]["grounded"] = True
+    o["self"]["in_zone"] = True
+    x, y, z = o["self"]["pos"]
+    o["zone"] = {"center": [x, y], "radius": 600.0, "next_center": [x, y],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 190.0, "dps": 20.0}
+    # At t_impact = 3.5 s: x_0 = x - 30*3.5 = x - 105, vx = 30, z_0 = z + 0.5*22*3.5^2 = z + 134.75, vz = 0
+    o["projectiles"] = [{"id": 401, "kind": "mortar",
+                         "pos": [x - 105.0, y, z + 134.75],
+                         "vel": [30.0, 0.0, 0.0]}]
+    bot.send(o)
+    _ = json.loads(bot.next_line())
+    # Next tick: projectile no longer in FOV (projectiles = []), still 3.3 s to impact
+    o["tick"] = 9000241
+    o["t"] = 170.2
+    o["projectiles"] = []
+    bot.send(o)
+    act_mem = json.loads(bot.next_line())
+    out["mortar_mem_boost"] = bool(act_mem.get("boost"))
+    out["mortar_mem_pass"] = out["mortar_mem_boost"]
+
+    # 25. Charging-laser break-lock juke: even when we would otherwise walk
+    #     east toward a pickup, an enemy 90 m east charging a laser aimed at
+    #     us (aim = pi) must override movement into a perpendicular juke
+    #     (|mv[1]| > 0.6) with grounded boost.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900025
+    o["t"] = 180.0
+    o["offer"] = None
+    o["events"] = []
+    o["cubes"] = []
+    o["crates"] = []
+    o["projectiles"] = []
+    o["self"]["grounded"] = True
+    o["self"]["in_zone"] = True
+    o["self"]["weapons"] = [o["self"]["weapons"][0], None]
+    x, y, z = o["self"]["pos"]
+    o["zone"] = {"center": [x, y], "radius": 600.0, "next_center": [x, y],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 200.0, "dps": 20.0}
+    o["pickups"] = [{"id": 8400, "kind": "mortar", "pos": [x + 50.0, y, g.terrain_h(x + 50.0, y)]}]
+    o["mechs"] = [{"id": 79, "npc": False, "pos": [x + 90.0, y, g.terrain_h(x + 90.0, y)],
+                   "vel": [0.0, 0.0, 0.0], "aim": [math.pi, 0.0], "hp": 1400.0,
+                   "max_hp": 1400.0, "cubes": 0.0, "weapons": ["laser"], "charging": True}]
+    bot.send(o)
+    act_lj = json.loads(bot.next_line())
+    mv_lj = act_lj.get("move", [0.0, 0.0])
+    out["laser_juke_perp"] = round(abs(mv_lj[1]) / max(1e-9, math.hypot(*mv_lj)), 3)
+    out["laser_juke_boost"] = bool(act_lj.get("boost"))
+    out["laser_juke_pass"] = out["laser_juke_perp"] > 0.6 and out["laser_juke_boost"]
+
     return out
 
 
@@ -850,7 +912,9 @@ def main():
               "hurt_approach", "hurt_pass",
               "weave_fire", "weave_pass",
               "roof_loot_take", "roof_loot_east", "roof_loot_pass",
-              "dodge_boost", "dodge_pass"):
+              "dodge_boost", "dodge_pass",
+              "mortar_mem_boost", "mortar_mem_pass",
+              "laser_juke_perp", "laser_juke_boost", "laser_juke_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")
