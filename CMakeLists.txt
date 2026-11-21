@@ -13,6 +13,6 @@ add_library(mechfight STATIC src/mf.cpp)
 target_include_directories(mechfight PUBLIC src third_party)
 target_compile_options(mechfight PRIVATE -O2 -Wall -Wextra)
 
-add_executable(bot src/main.cpp src/bot.cpp)
+add_executable(bot src/main.cpp src/bot.cpp src/map.cpp)
 target_link_libraries(bot PRIVATE mechfight)
 target_compile_options(bot PRIVATE -O2 -Wall -Wextra)

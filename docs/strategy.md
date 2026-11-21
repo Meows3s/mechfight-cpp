@@ -116,8 +116,10 @@ final 4 matches are live.
 
 - **M1 (done).** Protocol-correct C++ bot, passes `check.py` natively and in the
   match sandbox. Zone-seeking, one weapon pickup, gun with lead.
-- **M2.** Map model (terrain + prisms), obstacle-aware navigation, threat-facing,
-  zone prediction. Expect the largest placement gain here.
+- **M2 (done).** Map model (terrain grid + prisms, spatial-indexed, verified
+  against an independent reimplementation), obstacle-aware steering, predictive
+  zone seeking, threat-facing, shot line-of-sight. `tools/trace_assert.py` now
+  audits every recorded decision and forces the paths the stream never reaches.
 - **M3.** Threat/dodge model, HP-aware disengage, laser charge-and-release,
   mortar arc solver.
 - **M4.** Cube/NPC/crate farming, supply-drop decisions, late-game brawl policy.
