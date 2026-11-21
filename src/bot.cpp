@@ -217,14 +217,6 @@ class MechBot final : public Bot {
     const double hp_frac = me.max_hp > 0.0 ? me.hp / me.max_hp : 1.0;
     const double enemy_d =
         enemy ? hypot2(enemy->pos[0] - me_xy[0], enemy->pos[1] - me_xy[1]) : 1e18;
-    // Fast deterministic strafe reversal (0.85..1.30 s): ground_accel (58.5)
-    // reverses walk_speed (11.7) in 0.40 s, matching bullet flight time at
-    // 100 m so linear velocity lead shoots behind us instead of tracking a
-    // 3-second arc.
-    if (o.t >= strafe_until_) {
-      strafe_sign_ = -strafe_sign_;
-      strafe_until_ = o.t + 0.85 + 0.45 * ((next_rand() >> 8) * (1.0 / 16777216.0));
-    }
     // Can the mortar reach them from here? Behind cover the flat arc is
     // blocked and the lob must fit under max_pitch -- which physics only
     // allows beyond ~125 m (solve_pitch: A = g d^2 / 2v^2 grows with range, so
@@ -239,7 +231,6 @@ class MechBot final : public Bot {
     // The committed duel: one visible hunter, we are healthy, no mortar (with
     // a mortar we never close -- that is what the shells are for).
     const bool duel = under_fire && !mortar_armed && attackers == 1 && hp_frac > 0.6 && enemy;
-    const Actor* threat = enemy ? enemy : spotter;
 
     if (!settled) {
       // Outside the closing circle that death is certain; everything else is
@@ -269,36 +260,34 @@ class MechBot final : public Bot {
                                {1.0, 0.0}),
                        12.0);
         hide_state_ = 0;
-      } else if (const mf::Drop* drop = safe_drop(o, me, me_xy, zone, margin)) {
-        // Uncontested nearby supply drop: 3 cubes + full HP + full energy.
-        if (dist2(xy(drop->pos), me_xy) > drop->radius * 0.5) {
-          a.move = avoid(me.pos,
-                         norm_or({drop->pos[0] - me_xy[0], drop->pos[1] - me_xy[1]},
-                                 {1.0, 0.0}),
-                         12.0);
-        } else {
-          a.move = {0.0, 0.0};
-        }
-        hide_state_ = 0;
       } else {
         // Nothing in view: hold covered ground and keep sweeping -- the sweep
         // is what finds the pickups.
-        steer_hide(a, me, me_xy, zone, true, threat, false, mortar_armed);
+        steer_hide(a, me, me_xy, zone, true, spotter, false);
       }
     } else if (has_arc) {
-      // BOMBARD: pick a spot that blocks the enemy's direct sightline while
-      // keeping them in the mortar's 125-215 m lob window, and never stand
-      // still if they currently have direct line of sight on us.
-      steer_hide(a, me, me_xy, zone, true, threat, under_fire, mortar_armed);
+      // BOMBARD: hold the covered spot and shell them over the wall. If they
+      // have direct sight on us inside 95 m while we hold a mortar (cook-off
+      // risk against lasers), slide to a covered spot further away while
+      // shelling.
+      const bool exposed_close =
+          enemy && enemy_d < 95.0 && have_map_ &&
+          map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},
+                        {me.pos[0], me.pos[1], me.pos[2] + 4.5});
+      steer_hide(a, me, me_xy, zone, true, exposed_close ? enemy : nullptr, under_fire);
     } else if (mortar_armed && enemy && enemy_d < 150.0) {
       // Armed but no arc (they are inside the lob's floor behind a wall): kite.
       // Opening range re-solves the ballistic window, and covered ground away
       // from them is where the next volley comes from.
-      steer_hide(a, me, me_xy, zone, true, enemy, under_fire, mortar_armed);
+      steer_hide(a, me, me_xy, zone, true, enemy, under_fire);
     } else if (duel) {
       // Committed 1v1, M1's mode: close to standoff and trade. The rare
       // opening win is worth a whole place, and a retreating gun fight at
       // 156 dps never saved anyone.
+      if (o.t >= strafe_until_) {
+        strafe_sign_ = (next_rand() & 1u) ? 1.0 : -1.0;
+        strafe_until_ = o.t + 2.0 + 2.0 * ((next_rand() >> 8) * (1.0 / 16777216.0));
+      }
       const Vec2 u = norm_or({enemy->pos[0] - me_xy[0], enemy->pos[1] - me_xy[1]}, {1.0, 0.0});
       const double radial =
           enemy_d > standoff_ + 12.0 ? 1.0 : (enemy_d < standoff_ - 12.0 ? -1.0 : 0.0);
@@ -309,23 +298,22 @@ class MechBot final : public Bot {
                      12.0);
       hide_state_ = 3;
     } else {
-      // COVER / FLEE: covered ground that puts a building between us and the
-      // threat; sprint and answer once they are actually shooting.
-      steer_hide(a, me, me_xy, zone, true, threat, under_fire, mortar_armed);
+      // COVER / FLEE: covered ground away from whoever has seen us; sprint
+      // and answer once they are actually shooting.
+      steer_hide(a, me, me_xy, zone, true, spotter, under_fire);
     }
 
     // Fire whenever we hold the mortar (the arc needs no line of sight -- that
     // is the entire point), whenever we are in active combat, or whenever we
-    // are mid-charge on a laser so we never drop a charged beam. When alone in
-    // cover (and no floor weapon is waiting to be picked up), pop nearby
-    // ground crates in LOS with the arm gun for cubes/upgrades and 50% weapon
-    // drops.
+    // are mid-charge on a laser so we never drop a charged beam. When armed
+    // and completely alone in cover, pop nearby ground crates in LOS with the
+    // arm gun for free cubes/upgrades and 50% mortar drops.
     const bool laser_charging =
         me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Laser && me.weapons[1].charge > 0.0;
     const Actor* fire_enemy =
         (under_fire || laser_charging || (mortar_armed && enemy)) ? enemy : nullptr;
-    const Farm crate_farm = (!fire_enemy && (me.has_weapon[1] || o.pickups.empty()) && !enemy &&
-                             !spotter && !under_fire && me.cubes < kCubeTarget)
+    const Farm crate_farm = (!fire_enemy && me.has_weapon[1] && !enemy && !spotter &&
+                             !under_fire && me.cubes < kCubeTarget)
                                 ? pick_safe_crate(o, me, zone, margin)
                                 : Farm{};
     shoot(a, me, fire_enemy, crate_farm);
@@ -892,39 +880,19 @@ class MechBot final : public Bot {
           if (map_.sight_run(x, y, tz, std::cos(ang), std::sin(ang), 48.0) < 48.0) ++blocked;
         }
         const double cover = static_cast<double>(blocked) / kDirs;
-        if (cover >= 0.25) hide_spots_.push_back({x, y, z, cover});
+        if (cover >= 0.25) hide_spots_.push_back({x, y, cover});
       }
     }
-  }
-
-  // Uncontested landed/landing supply drop nearby when we need HP or cubes.
-  const mf::Drop* safe_drop(const Obs& o, const Self& me, const Vec2& me_xy,
-                            const Circle& zone, double margin) const {
-    if (me.hp >= me.max_hp * 0.92 && me.cubes >= kCubeTarget) return nullptr;
-    const mf::Drop* best = nullptr;
-    double best_d = 65.0;
-    for (const auto& d : o.drops) {
-      if (d.lands_in > 4.0) continue;
-      if (std::fabs(d.pos[2] - me.pos[2]) > 3.8) continue;
-      if (dist2(xy(d.pos), zone.center) > zone.radius - margin) continue;
-      const double dist = dist2(xy(d.pos), me_xy);
-      if (dist < best_d) {
-        best_d = dist;
-        best = &d;
-      }
-    }
-    return best;
   }
 
   // Hold the most covered spot inside the circle the zone is closing to, and
-  // sit on it. When a threat is known, strongly prefer spots where a building
-  // actually blocks the threat's direct line of sight (not merely spots near a
-  // wall that happens to be behind us!), and when mortar-armed, prefer spots
-  // inside the 125-215 m lob window. Never stand still while exposed to direct
-  // line of sight.
+  // sit on it. Cover first, deep-in-the-circle second, a short walk third,
+  // away from whoever has seen us, and sticky so near-equal spots do not
+  // dither us across open ground. No covered ground left (the open endgame):
+  // hold the centre -- by then it is an HP auction, not a hiding contest.
   void steer_hide(Action& a, const Self& me, const Vec2& me_xy,
                   const Circle& zone, bool settled, const Actor* spotter,
-                  bool under_fire, bool mortar_armed = false) {
+                  bool under_fire) {
     if (!settled) {
       // Outside the closing circle that death is certain; cover is not the
       // problem. Get back in.
@@ -937,37 +905,23 @@ class MechBot final : public Bot {
       return;
     }
     const double margin = mech_radius_ + 6.0;
-    const Vec3 threat_muz =
-        spotter ? Vec3{spotter->pos[0], spotter->pos[1], spotter->pos[2] + 7.0} : Vec3{};
     const HideSpot* best = nullptr;
     double best_rank = -1e18;
     for (const auto& s : hide_spots_) {
       const double dc = hypot2(s.x - zone.center[0], s.y - zone.center[1]);
       if (dc > zone.radius - margin) continue;
-      const double d_me = hypot2(s.x - me_xy[0], s.y - me_xy[1]);
-      double rank = s.cover * 300.0 - 0.2 * dc - 0.12 * d_me;
+      double rank = s.cover * 300.0 - 0.2 * dc - 0.1 * hypot2(s.x - me_xy[0], s.y - me_xy[1]);
       if (s.x == hide_tx_ && s.y == hide_ty_) rank += 25.0;  // stickiness
-      for (const auto& mz : mortar_zones_) {
-        if (hypot2(s.x - mz.x, s.y - mz.y) < mz.radius + 2.0) rank -= 2000.0;
-      }
-      if (spotter) {
-        const double ds = hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]);
-        rank += std::min(ds, 250.0) * 1.5;
-        // Beyond 285 m no weapon can reach; within 160 m of us, raycast to
-        // verify a building actually blocks the shooter's line of sight.
-        if (d_me <= 160.0 && (ds > 285.0 || (have_map_ && !map_.shot_los(threat_muz, {s.x, s.y, s.z + 4.5})))) {
-          rank += 450.0;
-          if (mortar_armed && ds >= 125.0 && ds <= 215.0) rank += 200.0;
-        }
-      }
+      if (spotter)
+        // When someone has seen us, opening the range dominates cover quality:
+        // the best-covered spot 60 m from their muzzles is still 60 m from
+        // their muzzles. Up to 375 rank points of separation.
+        rank += std::min(hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]), 250.0) * 1.5;
       if (rank > best_rank) {
         best_rank = rank;
         best = &s;
       }
     }
-    const bool exposed_now =
-        spotter && have_map_ &&
-        map_.shot_los(threat_muz, {me.pos[0], me.pos[1], me.pos[2] + 4.5});
     if (!best) {
       if (dist2(me_xy, zone.center) > 6.0) {
         a.move = avoid(me.pos,
@@ -975,11 +929,6 @@ class MechBot final : public Bot {
                                {1.0, 0.0}),
                        12.0);
         hide_state_ = 0;
-      } else if (exposed_now) {
-        const Vec2 u = norm_or({spotter->pos[0] - me_xy[0], spotter->pos[1] - me_xy[1]},
-                               {1.0, 0.0});
-        a.move = avoid(me.pos, {-u[1] * strafe_sign_, u[0] * strafe_sign_}, 10.0);
-        hide_state_ = 2;
       } else {
         a.move = {0.0, 0.0};
         hide_state_ = 1;
@@ -990,16 +939,7 @@ class MechBot final : public Bot {
     hide_ty_ = best->y;
     const double d = hypot2(best->x - me_xy[0], best->y - me_xy[1]);
     if (d < 4.0) {
-      if (exposed_now) {
-        // Never sit still in direct line of sight of a hunter: strafe
-        // perpendicular so linear-leaded gun rounds and shells miss.
-        const Vec2 u = norm_or({spotter->pos[0] - me_xy[0], spotter->pos[1] - me_xy[1]},
-                               {1.0, 0.0});
-        a.move = avoid(me.pos, {-u[1] * strafe_sign_, u[0] * strafe_sign_}, 10.0);
-        hide_state_ = 2;
-        return;
-      }
-      a.move = {0.0, 0.0};  // parked and occluded: silent posture
+      a.move = {0.0, 0.0};  // parked: standing still is the only silent posture
       hide_state_ = 1;
       return;
     }
@@ -1027,19 +967,18 @@ class MechBot final : public Bot {
     return best;
   }
 
-  // Record incoming mortar impact zones across ticks. Projectiles vanish from
-  // obs.projectiles the moment our 120-deg FOV turns away (protocol section 8),
-  // and a lobbed shell flies for up to 6.5 s -- without memory we would step
-  // out of a blast ring on tick 1 and walk right back into it on tick 2. Also
-  // drops an audio danger zone at our current position when we hear a near/mid
-  // mortar launch so blind lobs over buildings hit empty ground.
+  // Track visible incoming mortar shells across ticks. obs.projectiles only
+  // lists a shell while it is inside our current 120-deg FOV wedge (protocol
+  // section 8), and a high lob flies for up to 6.5 s (ttl 7.0 s). Recording
+  // shells whose parabola lands near us prevents stepping back onto the impact
+  // point on the next tick when our torso turns to aim elsewhere.
   void update_mortar_zones(const Obs& o, const Self& me, const Vec2& me_xy) {
     mortar_zones_.erase(
         std::remove_if(mortar_zones_.begin(), mortar_zones_.end(),
                        [&](const MortarZone& z) { return o.t > z.until; }),
         mortar_zones_.end());
 
-    const double blast_r = splash_radius_ + mech_radius_ + 4.5;
+    const double blast_r = splash_radius_ + mech_radius_ + 4.0;
     for (const auto& p : o.projectiles) {
       if (p.kind != WeaponKind::Mortar) continue;
       double best_d = 1e18;
@@ -1058,13 +997,16 @@ class MechBot final : public Bot {
           }
         }
         if (have_map_ && sz <= map_.terrain_h(sx, sy)) {
-          if (best_d > 1e9) {
+          const double d = hypot2(sx - me_xy[0], sy - me_xy[1]);
+          if (d < best_d) {
+            best_d = d;
             hit_xy = {sx, sy};
             hit_t = t;
           }
           break;
         }
       }
+      if (best_d > blast_r + 12.0) continue;  // not headed near us
       bool updated = false;
       for (auto& mz : mortar_zones_) {
         if (mz.id == p.id && p.id >= 0) {
@@ -1072,7 +1014,7 @@ class MechBot final : public Bot {
           mz.y = hit_xy[1];
           mz.vx = p.vel[0];
           mz.vy = p.vel[1];
-          mz.until = o.t + hit_t + 0.20;
+          mz.until = o.t + hit_t + 0.15;
           mz.radius = blast_r;
           updated = true;
           break;
@@ -1080,122 +1022,80 @@ class MechBot final : public Bot {
       }
       if (!updated && mortar_zones_.size() < 16) {
         mortar_zones_.push_back(
-            {p.id, hit_xy[0], hit_xy[1], p.vel[0], p.vel[1], o.t + hit_t + 0.20, blast_r});
-      }
-    }
-
-    for (const auto& s : o.sounds) {
-      if (s.kind != "mortar" || s.dist == mf::Dist::Far || s.age > 0.25) continue;
-      const double lead_x = me_xy[0] + me.vel[0] * 1.2;
-      const double lead_y = me_xy[1] + me.vel[1] * 1.2;
-      bool covered = false;
-      for (const auto& mz : mortar_zones_) {
-        if (hypot2(mz.x - lead_x, mz.y - lead_y) < mz.radius) {
-          covered = true;
-          break;
-        }
-      }
-      if (!covered && mortar_zones_.size() < 16) {
-        mortar_zones_.push_back({-1, lead_x, lead_y, -std::cos(s.bearing), -std::sin(s.bearing),
-                                 o.t + 3.2, splash_radius_ + mech_radius_ + 2.5});
+            {p.id, hit_xy[0], hit_xy[1], p.vel[0], p.vel[1], o.t + hit_t + 0.15, blast_r});
       }
     }
   }
 
-  // Four-layer juking and hazard-evasion protocol:
-  // 1. Persistent mortar blast-ring escape (visual 7 s parabola + audio launch).
-  // 2. Charging-laser break-lock juke (ducks behind cover or sprints sideways
-  //    even when already moving, preventing walk-down-the-barrel hits).
-  // 3. Incoming gun-bullet stream sidestep (obs.projectiles time-of-closest-
-  //    approach within 0.75 s).
-  // 4. Anti-lead serpentine juke when an enemy turret is locked onto us
-  //    (injects >=83% lateral velocity across their crosshair so linear
-  //    velocity leading misses on each 0.85..1.30 s reversal).
+  // Emergency dodge reflex for telegraphed high-damage hazards:
+  // 1. Incoming mortar shells (200 direct + 160 splash + 45 energy concussion):
+  //    uses persistent 7.0 s trajectory memory (mortar_zones_) so shells are
+  //    still dodged after leaving our FOV wedge.
+  // 2. Enemy charging a laser aimed at us (315 damage, or 504 cook-off when we
+  //    hold a mortar!): sprints perpendicular to their aim ray whenever we are
+  //    stationary or walking along their beam, preferring a wall-duck if one
+  //    is within 10 m.
+  // 3. Incoming gun round aimed at us while parked (move < 0.1): sidesteps out
+  //    of the bullet ray.
   void dodge_hazards(Action& a, const Obs& o, const Self& me, const Vec2& me_xy) const {
-    // Layer 1: Mortar blast zones (persisted across ticks).
-    const Vec2 proj_xy{me_xy[0] + me.vel[0] * 0.35, me_xy[1] + me.vel[1] * 0.35};
+    const Vec2 proj_xy{me_xy[0] + me.vel[0] * 0.30, me_xy[1] + me.vel[1] * 0.30};
     for (const auto& mz : mortar_zones_) {
       const double d_now = hypot2(me_xy[0] - mz.x, me_xy[1] - mz.y);
       const double d_proj = hypot2(proj_xy[0] - mz.x, proj_xy[1] - mz.y);
       if (std::min(d_now, d_proj) < mz.radius) {
-        const Vec2 perp = norm_or({-mz.vy * strafe_sign_, mz.vx * strafe_sign_}, {1.0, 0.0});
+        const Vec2 perp = norm_or({-mz.vy, mz.vx}, {1.0, 0.0});
         const Vec2 away = d_now > 2.5 ? norm_or({me_xy[0] - mz.x, me_xy[1] - mz.y}, perp) : perp;
         a.move = avoid(me.pos, away, 10.0);
         if (me.grounded) a.boost = true;
         return;
       }
     }
-
-    // Layer 2: Enemy charging a laser with line of sight to us.
     for (const auto& e : o.mechs) {
       if (e.npc || !e.charging) continue;
+      const double to_us = std::atan2(me_xy[1] - e.pos[1], me_xy[0] - e.pos[0]);
+      if (angle_diff(e.aim[0], to_us) > 0.35) continue;  // not aimed at us
       const Vec3 em{e.pos[0], e.pos[1], e.pos[2] + 7.0};
       if (have_map_ && !map_.shot_los(em, {me.pos[0], me.pos[1], me.pos[2] + 4.5})) continue;
       if (me.grounded) a.boost = true;
       const Vec2 beam{std::cos(e.aim[0]), std::sin(e.aim[0])};
-      const Vec2 to_me{me_xy[0] - e.pos[0], me_xy[1] - e.pos[1]};
-      const double cross = beam[0] * to_me[1] - beam[1] * to_me[0];
-      const Vec2 p1 = cross >= 0.0 ? Vec2{-beam[1], beam[0]} : Vec2{beam[1], -beam[0]};
-      const Vec2 p2{-p1[0], -p1[1]};
-      // If a 10 m sidestep ducks behind a wall before the 0.75 s charge ends, take it.
-      Vec2 pick = p1;
-      if (have_map_) {
-        const bool c1 =
-            map_.clearance(me.pos, p1, 10.0, mech_height_, step_up_, max_slope_) >= 6.0 &&
-            !map_.shot_los(em, {me.pos[0] + p1[0] * 10.0, me.pos[1] + p1[1] * 10.0, me.pos[2] + 4.5});
-        const bool c2 =
-            map_.clearance(me.pos, p2, 10.0, mech_height_, step_up_, max_slope_) >= 6.0 &&
-            !map_.shot_los(em, {me.pos[0] + p2[0] * 10.0, me.pos[1] + p2[1] * 10.0, me.pos[2] + 4.5});
-        if (c2 && !c1) pick = p2;
-      }
-      a.move = avoid(me.pos, pick, 10.0);
-      return;
-    }
-
-    // Layer 3: Incoming gun bullet stream (252 m/s).
-    for (const auto& p : o.projectiles) {
-      if (p.kind != WeaponKind::Gun) continue;
-      const double v2 = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1];
-      if (v2 < 100.0) continue;
-      const double rx = me_xy[0] - p.pos[0], ry = me_xy[1] - p.pos[1];
-      const double t_ca = (rx * p.vel[0] + ry * p.vel[1]) / v2;
-      if (t_ca < 0.02 || t_ca > 0.75) continue;
-      const double cx = p.pos[0] + p.vel[0] * t_ca;
-      const double cy = p.pos[1] + p.vel[1] * t_ca;
-      const double miss = hypot2(me_xy[0] - cx, me_xy[1] - cy);
-      if (miss < mech_radius_ + 2.2) {
-        const Vec2 perp = norm_or({-p.vel[1] * strafe_sign_, p.vel[0] * strafe_sign_}, {1.0, 0.0});
-        const Vec2 away = miss > 0.4 ? norm_or({me_xy[0] - cx, me_xy[1] - cy}, perp) : perp;
-        a.move = avoid(me.pos, away, 10.0);
-        if (me.grounded && me.energy > 30.0) a.boost = true;
-        return;
-      }
-    }
-
-    // Layer 4: Enemy turret lock-on serpentine juke.
-    for (const auto& e : o.mechs) {
-      if (e.npc) continue;
-      const double d = hypot2(me_xy[0] - e.pos[0], me_xy[1] - e.pos[1]);
-      if (d > 235.0 || d < 1.0) continue;
-      const double to_us = std::atan2(me_xy[1] - e.pos[1], me_xy[0] - e.pos[0]);
-      if (angle_diff(e.aim[0], to_us) > 0.22) continue;  // not locked onto us
-      if (have_map_ &&
-          !map_.shot_los({e.pos[0], e.pos[1], e.pos[2] + 7.0},
-                         {me.pos[0], me.pos[1], me.pos[2] + 4.5})) {
-        continue;
-      }
-      const Vec2 los_u{(me_xy[0] - e.pos[0]) / d, (me_xy[1] - e.pos[1]) / d};
-      const Vec2 perp{-los_u[1] * strafe_sign_, los_u[0] * strafe_sign_};
       const Vec2 mv = a.move.value_or(Vec2{0.0, 0.0});
       const double mv_len = hypot2(mv[0], mv[1]);
-      const double along = mv_len > 0.05 ? (mv[0] * los_u[0] + mv[1] * los_u[1]) / mv_len : 0.0;
-      if (mv_len < 0.1 || std::fabs(along) > 0.70) {
-        const double rad = mv_len < 0.1 ? 0.0 : (along >= 0.0 ? 0.55 : -0.55);
-        const Vec2 juke =
-            norm_or({los_u[0] * rad + perp[0] * 0.84, los_u[1] * rad + perp[1] * 0.84}, perp);
-        a.move = avoid(me.pos, juke, 10.0);
+      const double along = mv_len > 0.05 ? std::fabs(mv[0] * beam[0] + mv[1] * beam[1]) / mv_len : 1.0;
+      if (mv_len < 0.1 || along > 0.75) {
+        const Vec2 to_me{me_xy[0] - e.pos[0], me_xy[1] - e.pos[1]};
+        const double cross = beam[0] * to_me[1] - beam[1] * to_me[0];
+        const Vec2 p1 = cross >= 0.0 ? Vec2{-beam[1], beam[0]} : Vec2{beam[1], -beam[0]};
+        const Vec2 p2{-p1[0], -p1[1]};
+        Vec2 pick = p1;
+        if (have_map_) {
+          const bool c1 =
+              map_.clearance(me.pos, p1, 10.0, mech_height_, step_up_, max_slope_) >= 6.0 &&
+              !map_.shot_los(em, {me.pos[0] + p1[0] * 10.0, me.pos[1] + p1[1] * 10.0, me.pos[2] + 4.5});
+          const bool c2 =
+              map_.clearance(me.pos, p2, 10.0, mech_height_, step_up_, max_slope_) >= 6.0 &&
+              !map_.shot_los(em, {me.pos[0] + p2[0] * 10.0, me.pos[1] + p2[1] * 10.0, me.pos[2] + 4.5});
+          if (c2 && !c1) pick = p2;
+        }
+        a.move = avoid(me.pos, pick, 10.0);
       }
       return;
+    }
+    if (!a.move || hypot2((*a.move)[0], (*a.move)[1]) < 0.1) {
+      for (const auto& p : o.projectiles) {
+        if (p.kind != WeaponKind::Gun) continue;
+        const double v2 = p.vel[0] * p.vel[0] + p.vel[1] * p.vel[1];
+        if (v2 < 100.0) continue;
+        const double rx = me_xy[0] - p.pos[0], ry = me_xy[1] - p.pos[1];
+        const double t_ca = (rx * p.vel[0] + ry * p.vel[1]) / v2;
+        if (t_ca < 0.02 || t_ca > 0.65) continue;
+        const double cx = p.pos[0] + p.vel[0] * t_ca;
+        const double cy = p.pos[1] + p.vel[1] * t_ca;
+        if (hypot2(me_xy[0] - cx, me_xy[1] - cy) < mech_radius_ + 1.8) {
+          const Vec2 perp = norm_or({-p.vel[1], p.vel[0]}, {1.0, 0.0});
+          a.move = avoid(me.pos, perp, 10.0);
+          return;
+        }
+      }
     }
   }
 
@@ -1459,13 +1359,13 @@ class MechBot final : public Bot {
 
   // Run-and-hide state (see steer_hide).
   struct HideSpot {
-    double x = 0.0, y = 0.0, z = 0.0, cover = 0.0;  // cover: blocked sightline fraction
+    double x = 0.0, y = 0.0, cover = 0.0;  // cover: blocked sightline fraction
   };
   struct MortarZone {
     int id = -1;
     double x = 0.0, y = 0.0, vx = 0.0, vy = 0.0;
     double until = -1.0;
-    double radius = 14.0;
+    double radius = 13.5;
   };
   std::vector<HideSpot> hide_spots_;
   std::vector<MortarZone> mortar_zones_;
