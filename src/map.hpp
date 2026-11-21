@@ -43,9 +43,22 @@ class Map {
 
   bool in_bounds(double x, double y) const;
 
+  // Arena bounds, from world.json's `bounds` (the same numbers in_bounds uses).
+  double bound_x0() const { return bx0_; }
+  double bound_x1() const { return bx1_; }
+  double bound_y0() const { return by0_; }
+  double bound_y1() const { return by1_; }
+
   // May a mech standing at feet height `z` occupy (x,y)? Rejects walls, steps
   // taller than step_up, and out-of-bounds cells.
   bool walkable(double x, double y, double z, double height, double step_up) const;
+
+  // How far a horizontal sightline from (x, y, z) toward (dx, dy) runs before
+  // terrain or a building stops it, capped at `cap`. The arena edge counts as
+  // blocked. Coarse by design: this scores how exposed a standing spot is, at
+  // hello time, over a grid -- not a per-tick precision query.
+  double sight_run(double x, double y, double z, double dx, double dy,
+                   double cap, double step = 3.0) const;
 
   // How far along `dir` (unit, horizontal) can the mech travel before it is
   // blocked or the slope exceeds max_slope_deg? Capped at max_len.

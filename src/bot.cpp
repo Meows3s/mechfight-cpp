@@ -135,6 +135,9 @@ class MechBot final : public Bot {
     max_energy_ = hello.cfg("mech", "energy", 100.0);
 
     have_map_ = map_.load(hello.map_dir, hello.map_files);
+    // Cover is a static property of the map, so the hide-spot table is built
+    // once, here, where the 50 ms per-observation budget does not apply.
+    build_hide_spots();
   }
 
   std::string name() const override { return "apex"; }
@@ -165,56 +168,67 @@ class MechBot final : public Bot {
     cur_max_energy_ = me.max_energy > 0.0 ? me.max_energy : max_energy_;
 
     take_upgrade(a, o);
-    take_loot(a, o, me_xy);
+    // RUN AND HIDE takes NOTHING: no take_loot. Even a free weapon at our feet
+    // is a detour this strategy refuses -- its whole value is arriving at the
+    // final melt untouched.
 
     // Remember who last hit us and from where: that is what we face when idle.
+    // Age the previous bearing BEFORE the events: a damaged event in THIS
+    // observation means the hit landed after the last one, so it must read as
+    // fresh however far apart the observations are (real ones come 0.1 s
+    // apart; a `+= dt` after the reset would call a brand-new hit 76 s old).
+    threat_age_ += dt;
     for (const auto& e : o.events)
       if (e.type == "damaged" && e.has_bearing) {
         threat_bearing_ = e.bearing;
         threat_age_ = 0.0;
       }
-    threat_age_ += dt;
 
     const Circle zone = predicted_zone(o);
     const double margin = mech_radius_ + 6.0;
     const bool settled = dist2(me_xy, zone.center) <= zone.radius - margin;
 
-    // Cheapest kill first (low HP costs least to finish). `engage` -- whether
-    // the trade is predicted to go our way -- decides ONLY whether we close on
-    // it. A second weapon is hunter parity (gun 156 -> gun+laser 287.5 dps),
-    // so armed we fight like M1 did: close to standoff, strafe, keep firing.
-    // M1 is still the best-scoring submission (1.42) and closing-and-strafing
-    // is the one behaviour every later build dropped; the survival harness
-    // cannot see its value because it resolves fire as hitscan, while the
-    // real server simulates gun rounds with spread and travel time that a
-    // strafing mech partly dodges. Gun-only, keep the 1.27 behaviour instead:
-    // never close, sprint under fire, return fire from range.
-    const Actor* enemy = pick_enemy(o, me);
-    const bool engage = enemy != nullptr &&
-                        (winnable(o, me, *enemy) || me.has_weapon[1]);
+    // RUN AND HIDE. Six submissions of evidence: every build that sought a
+    // fight scored 0.15-1.02, and the two that only answered fire scored
+    // highest (1.23, 1.27). Damage taken is the only currency that has ever
+    // moved the score, because the last ~65 s are a 260 dps melt ordered by
+    // remaining HP. So: take nothing, farm nothing, seek nothing. Sit on the
+    // most covered ground inside the closing circle, silently. When someone
+    // spots us, relocate away. When we are actually hit, quiet is spent
+    // anyway -- sprint, and answer.
+    const Actor* enemy = pick_enemy(o, me);   // only ever a return-fire target
+    const Actor* spotter = spotted(o, me);    // anyone close enough to have seen us
+    const bool under_fire = threat_age_ < 3.0;
 
-    const Farm farm = (!engage && me.cubes < kCubeTarget) ? pick_farm(o, zone, margin) : Farm{};
+    steer_hide(a, me, me_xy, zone, settled, spotter, under_fire);
+    // Return fire only while under fire: a shot from hiding reveals us for
+    // nothing, and the squad shares vision. The LOS gate inside shoot() still
+    // refuses rounds into walls.
+    shoot(a, me, (under_fire && enemy) ? enemy : nullptr, Farm{});
 
-    steer(a, o, me, me_xy, zone, settled, engage ? enemy : nullptr, farm);
-    // Fire at the enemy whether or not we are closing on it. Refusing to shoot
-    // while being shot at is strictly dominated: the gun costs no energy to fire,
-    // the squad shares vision so we are already located, and every kill is a place
-    // point. tools/los_audit.py measured the old wiring withholding fire on 87 of
-    // 112 geometrically open in-range shots, which is how a bot that armed itself
-    // sensibly still died first. The line-of-sight gate inside shoot() still
-    // stops us wasting rounds into walls.
-    shoot(a, me, enemy, farm);
-    // Sprint while someone actually has a shot line on us and the trade is not
-    // winnable. Boost is 19.5 m/s against a hunter's 11.7, so a few seconds of
-    // it opens ~47 m they must re-close while buildings keep breaking their
-    // line -- and it costs no aim and no shots. In the air boost *is* the jet,
-    // so only ever sprint grounded.
-    if (!engage && enemy && have_map_ && me.grounded &&
+    if (!under_fire) {
+      if (enemy) {
+        // Spotted but not yet shot at: face it. The front arc is 180 deg and
+        // turning is silent.
+        Vec2 am = aim_at(muzzle(me), centre(*enemy));
+        am[1] = std::clamp(am[1], min_pitch_, max_pitch_);
+        a.aim = am;
+      } else {
+        // Quiet: sweep the torso. A fixed wedge leaves 240 deg of blind
+        // approach, and scanning costs only aim time we are not using.
+        a.aim = {std::fmod(o.t * 0.4, 2.0 * kPi) - kPi, 0.0};
+      }
+    }
+
+    // Under fire and they still hold a shot line: quiet is spent, so sprint --
+    // 19.5 m/s against their 11.7 -- while the relocation re-opens range. In
+    // the air boost *is* the jet, so only ever sprint grounded.
+    if (under_fire && enemy && have_map_ && me.grounded &&
         map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},  // muzzle_height
                       {me.pos[0], me.pos[1], me.pos[2] + 4.5})) {
       a.boost = true;
     }
-    draw(a, o, me, zone, enemy, farm);
+    draw(a, o, me, zone, enemy, Farm{});
     return a;
   }
 
@@ -663,6 +677,119 @@ class MechBot final : public Bot {
                    12.0);
   }
 
+  // ---------------------------------------------------------------- run and hide
+
+  static constexpr double kHideSpotRange = 150.0;  // a mech this close has seen us
+
+  // Anyone close enough to have laid eyes on us. Vision is mutual, give or
+  // take the yaw wedge, so a mech this close is a fair bet to have spotted us
+  // even outside our own wedge: time to be somewhere else. Drones are ambient
+  // plinkers, not the squad -- they do not broadcast our position.
+  const Actor* spotted(const Obs& o, const Self& me) const {
+    const Vec3 m = muzzle(me);
+    const Actor* best = nullptr;
+    double best_d = kHideSpotRange;
+    for (const auto& a : o.mechs) {
+      if (a.npc) continue;
+      const double d = dist3(m, centre(a));
+      if (d < best_d) {
+        best_d = d;
+        best = &a;
+      }
+    }
+    return best;
+  }
+
+  // One-time at hello: score standing spots by how many of twelve sightlines
+  // from torso height are stopped within ~48 m. A spot in a courtyard or an
+  // alley scores near 1; open ground scores 0 and is dropped. Grid-coarse on
+  // purpose: this is a heat signal for spot selection, not a precision query.
+  void build_hide_spots() {
+    hide_spots_.clear();
+    if (!have_map_) return;
+    const double x0 = map_.bound_x0() + 12.0, x1 = map_.bound_x1() - 12.0;
+    const double y0 = map_.bound_y0() + 12.0, y1 = map_.bound_y1() - 12.0;
+    constexpr double kGrid = 24.0;
+    constexpr int kDirs = 12;
+    for (double x = x0; x <= x1; x += kGrid) {
+      for (double y = y0; y <= y1; y += kGrid) {
+        const double z = map_.terrain_h(x, y);
+        if (!map_.walkable(x, y, z, mech_height_, step_up_)) continue;
+        const double tz = z + 4.5;  // torso centre
+        int blocked = 0;
+        for (int i = 0; i < kDirs; ++i) {
+          const double ang = i * (2.0 * kPi / kDirs);
+          if (map_.sight_run(x, y, tz, std::cos(ang), std::sin(ang), 48.0) < 48.0) ++blocked;
+        }
+        const double cover = static_cast<double>(blocked) / kDirs;
+        if (cover >= 0.25) hide_spots_.push_back({x, y, cover});
+      }
+    }
+  }
+
+  // Hold the most covered spot inside the circle the zone is closing to, and
+  // sit on it. Cover first, deep-in-the-circle second, a short walk third,
+  // away from whoever has seen us, and sticky so near-equal spots do not
+  // dither us across open ground. No covered ground left (the open endgame):
+  // hold the centre -- by then it is an HP auction, not a hiding contest.
+  void steer_hide(Action& a, const Self& me, const Vec2& me_xy,
+                  const Circle& zone, bool settled, const Actor* spotter,
+                  bool under_fire) {
+    if (!settled) {
+      // Outside the closing circle that death is certain; cover is not the
+      // problem. Get back in.
+      a.move = avoid(me.pos,
+                     norm_or({zone.center[0] - me_xy[0], zone.center[1] - me_xy[1]},
+                             {1.0, 0.0}),
+                     12.0);
+      a.boost = !me.in_zone && dist2(me_xy, zone.center) > 25.0;
+      hide_state_ = 0;
+      return;
+    }
+    const double margin = mech_radius_ + 6.0;
+    const HideSpot* best = nullptr;
+    double best_rank = -1e18;
+    for (const auto& s : hide_spots_) {
+      const double dc = hypot2(s.x - zone.center[0], s.y - zone.center[1]);
+      if (dc > zone.radius - margin) continue;
+      double rank = s.cover * 300.0 - 0.2 * dc - 0.1 * hypot2(s.x - me_xy[0], s.y - me_xy[1]);
+      if (s.x == hide_tx_ && s.y == hide_ty_) rank += 25.0;  // stickiness
+      if (spotter)
+        rank += std::min(hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]), 250.0) * 0.5;
+      if (rank > best_rank) {
+        best_rank = rank;
+        best = &s;
+      }
+    }
+    if (!best) {
+      if (dist2(me_xy, zone.center) > 6.0) {
+        a.move = avoid(me.pos,
+                       norm_or({zone.center[0] - me_xy[0], zone.center[1] - me_xy[1]},
+                               {1.0, 0.0}),
+                       12.0);
+        hide_state_ = 0;
+      } else {
+        a.move = {0.0, 0.0};
+        hide_state_ = 1;
+      }
+      return;
+    }
+    hide_tx_ = best->x;
+    hide_ty_ = best->y;
+    const double d = hypot2(best->x - me_xy[0], best->y - me_xy[1]);
+    if (d < 4.0) {
+      a.move = {0.0, 0.0};  // parked: standing still is the only silent posture
+      hide_state_ = 1;
+      return;
+    }
+    a.move = avoid(me.pos,
+                   norm_or({best->x - me_xy[0], best->y - me_xy[1]}, {1.0, 0.0}),
+                   12.0);
+    // Sprint the relocation only once quiet is already spent.
+    a.boost = under_fire && d > 40.0;
+    hide_state_ = (spotter || under_fire) ? 2 : 0;
+  }
+
   const Item* nearest_cube(const Obs& o, const Vec2& me_xy, const Circle& zone) const {
     const Item* best = nullptr;
     double best_d = 45.0;
@@ -839,9 +966,9 @@ class MechBot final : public Bot {
       a.draw.line(muzzle(me), farm.point, "#40ff90");
       a.draw.point(farm.point, "#40ff90", 8.0);
     }
-    const char* mode = farm.kind == Farm::Kind::Drone ? "drone"
-                       : farm.kind == Farm::Kind::Crate ? "crate"
-                                                        : "";
+    const char* mode = hide_state_ == 2 ? "flee"
+                     : hide_state_ == 1 ? "sit"
+                                        : "seek";
     const char* held = me.has_weapon[1] ? weapon_name(me.weapons[1].kind) : "-";
     a.draw.label("hp " + std::to_string(static_cast<int>(me.hp)) + " c" +
                  std::to_string(static_cast<int>(me.cubes)) + "/" +
@@ -885,6 +1012,14 @@ class MechBot final : public Bot {
   double max_energy_ = 100.0;
   double cur_max_energy_ = 100.0;  // live me.max_energy: upgrades raise the climb ceiling
   double climb_until_ = -1.0;  // o.t until which we consider ourselves mid-climb
+
+  // Run-and-hide state (see steer_hide).
+  struct HideSpot {
+    double x = 0.0, y = 0.0, cover = 0.0;  // cover: blocked sightline fraction
+  };
+  std::vector<HideSpot> hide_spots_;
+  double hide_tx_ = 1e18, hide_ty_ = 1e18;  // the spot we are holding
+  int hide_state_ = 0;                      // 0 seek, 1 sit, 2 flee (label only)
 
   double last_t_ = -1.0;
   double threat_bearing_ = 0.0;

@@ -183,7 +183,9 @@ def synthetic(bot, obs, g, cfg):
     out["zone_run_boost"] = bool(act.get("boost"))
     out["zone_run_pass"] = dot > 0.9 and bool(act.get("boost"))
 
-    # 2. A real weapon within pickup_radius and an empty slot: must take it.
+    # 2. RUN AND HIDE takes nothing: even a free weapon at our feet is a detour
+    #    the strategy refuses -- its whole value is arriving at the final melt
+    #    untouched.
     o = json.loads(json.dumps(base))
     o["tick"] = 900002
     o["offer"] = None
@@ -193,7 +195,7 @@ def synthetic(bot, obs, g, cfg):
     bot.send(o)
     act = json.loads(bot.next_line())
     out["take_id"] = act.get("take")
-    out["take_pass"] = act.get("take") == 8123
+    out["take_pass"] = act.get("take") is None
 
     # 3. An offer where the best choice is NOT index 0 ("armor" outranks
     #    "sensors" and "jets"): must return the index, not the id.
@@ -231,69 +233,80 @@ def synthetic(bot, obs, g, cfg):
     else:
         out["wall_pass"] = False
 
-    # 5. A crate in the open, nothing else to shoot, no cubes yet: must pick it
-    #    as the target, aim at it, and fire. This is the farming path with the
-    #    ordinary gun.
+    # 5. Silent: a crate, a cube and a weapon pickup all in view, nobody
+    #    shooting -- no fire, no take. A shot broadcasts a bearing to a squad
+    #    that shares vision, and loot means crossing open ground.
     o = json.loads(json.dumps(base))
     o["tick"] = 900005
     o["mechs"] = []
-    o["pickups"] = []
-    o["cubes"] = []
     o["offer"] = None
     o["self"]["cubes"] = 0
+    o["self"]["weapons"] = [o["self"]["weapons"][0], None]
     o["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
                  "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
     o["self"]["in_zone"] = True
     x, y, z = o["self"]["pos"]
     o["crates"] = [{"id": 1007, "pos": [x + 6.0, y, g.terrain_h(x + 6.0, y)], "hp": 300.0}]
+    o["cubes"] = [{"id": 5012, "pos": [x + 10.0, y, z]}]
+    o["pickups"] = [{"id": 8124, "kind": "laser", "pos": [x + 4.0, y, z]}]
     bot.send(o)
     act = json.loads(bot.next_line())
-    want_yaw = math.atan2(0.0, 6.0)
-    aim_yaw = act.get("aim", [1e9, 0.0])[0]
-    out["crate_aim_err"] = round(abs((aim_yaw - want_yaw + math.pi) % (2 * math.pi) - math.pi), 4)
-    out["crate_fire"] = bool(act.get("fire", [False, False])[0])
-    mv = act.get("move", [0.0, 0.0])
-    out["crate_approach"] = round(mv[0] / max(1e-9, math.hypot(*mv)), 3)
-    out["crate_pass"] = (out["crate_aim_err"] < 0.15 and out["crate_fire"]
-                         and out["crate_approach"] > 0.8)
+    f = act.get("fire", [False, False])
+    out["silent_fire"] = [bool(f[0]), bool(f[1])]
+    out["silent_take"] = act.get("take")
+    out["silent_pass"] = not f[0] and not f[1] and act.get("take") is None
 
-    # 6. A cube on the ground: must walk at it to collect it.
+    # 6. Under fire: hit on the last event, an enemy in the open in range --
+    #    return fire. Quiet is already spent once they are shooting at us.
     o = json.loads(json.dumps(base))
     o["tick"] = 900006
-    o["mechs"] = []
-    o["crates"] = []
-    o["pickups"] = []
     o["offer"] = None
+    o["crates"] = []
+    o["cubes"] = []
+    o["pickups"] = []
     o["self"]["cubes"] = 0
     o["self"]["in_zone"] = True
+    o["self"]["hp"] = 1400.0
+    o["self"]["aim"] = [0.0, 0.0]
     o["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
                  "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
     x, y, z = o["self"]["pos"]
-    o["cubes"] = [{"id": 5012, "pos": [x + 10.0, y, z]}]
+    o["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun",
+                    "bearing": 0.0, "by": 77, "rear": False}]
+    o["mechs"] = [{"id": 77, "npc": False, "pos": [x + 60.0, y, g.terrain_h(x + 60.0, y)],
+                   "vel": [0.0, 0.0, 0.0], "aim": [0.0, 0.0], "hp": 1400.0,
+                   "max_hp": 1400.0, "cubes": 0.0, "weapons": ["gun"]}]
     bot.send(o)
     act = json.loads(bot.next_line())
-    mv = act.get("move", [0.0, 0.0])
-    out["cube_approach"] = round(mv[0] / max(1e-9, math.hypot(*mv)), 3)
-    out["cube_pass"] = out["cube_approach"] > 0.8
+    out["return_fire"] = bool(act.get("fire", [False, False])[0])
+    out["return_fire_pass"] = out["return_fire"]
 
-    # 7. Past the stat cap the bot must stop farming: cubes make the mech bigger
-    #    with no HP or damage gain after 10.
+    # 7. Quiet: the same enemy in the open in range, but nobody has hit us
+    #    recently -- this observation runs 10 s after test 6's hit, so the
+    #    under-fire window (3 s) has lapsed. Hold fire: a shot from hiding
+    #    reveals us for nothing.
     o = json.loads(json.dumps(base))
     o["tick"] = 900007
-    o["mechs"] = []
-    o["pickups"] = []
-    o["cubes"] = []
+    o["t"] = o["t"] + 10.0
     o["offer"] = None
-    o["self"]["cubes"] = 12
+    o["crates"] = []
+    o["cubes"] = []
+    o["pickups"] = []
+    o["events"] = []
+    o["self"]["cubes"] = 0
     o["self"]["in_zone"] = True
+    o["self"]["hp"] = 1400.0
+    o["self"]["aim"] = [0.0, 0.0]
     o["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
                  "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
     x, y, z = o["self"]["pos"]
-    o["crates"] = [{"id": 1008, "pos": [x + 6.0, y, g.terrain_h(x + 6.0, y)], "hp": 300.0}]
+    o["mechs"] = [{"id": 77, "npc": False, "pos": [x + 60.0, y, g.terrain_h(x + 60.0, y)],
+                   "vel": [0.0, 0.0, 0.0], "aim": [0.0, 0.0], "hp": 1400.0,
+                   "max_hp": 1400.0, "cubes": 0.0, "weapons": ["gun"]}]
     bot.send(o)
     act = json.loads(bot.next_line())
-    out["cap_fire"] = bool(act.get("fire", [False, False])[0])
-    out["cap_pass"] = not out["cap_fire"]  # refuses to farm past the cap
+    out["quiet_fire"] = bool(act.get("fire", [False, False])[0])
+    out["quiet_pass"] = not out["quiet_fire"]
 
     # ---------------------------------------------------------- M4 weapons
     # The mortar arc, the laser charge/release, and the fight maths all have
@@ -304,12 +317,16 @@ def synthetic(bot, obs, g, cfg):
                 "stats": {"damage": damage, "cooldown": cd, "speed": speed, "range": rng,
                           "spread_deg": 0.0, "mag": mag, "reload": reload_s}}
 
-    def duel(tick, weapons, dist_east, enemy_hp, extra_lasers=0):
+    def duel(tick, weapons, dist_east, enemy_hp, extra_lasers=0, hot=False):
         d = json.loads(json.dumps(base))
         d["tick"] = tick
         d["t"] = 100.0
         d["offer"] = None
-        d["events"] = []
+        # `hot`: we were hit on the last event, which is the only condition the
+        # hide strategy fires under. The weapon tests below are about aiming,
+        # so they all run hot.
+        d["events"] = ([{"type": "damaged", "amount": 45, "weapon": "gun",
+                         "bearing": 0.0, "by": 77, "rear": False}] if hot else [])
         d["pickups"] = []
         d["crates"] = []
         d["cubes"] = []
@@ -361,7 +378,7 @@ def synthetic(bot, obs, g, cfg):
     # 8. Holding a mortar at range: it outranks the gun, and the pitch returned
     #    must be a genuine arc that reaches the target -- matched against the
     #    closed form above, so a mortar aimed like a gun fails this.
-    o = duel(900008, [gun0, mortar], 60.0, 100.0)
+    o = duel(900008, [gun0, mortar], 60.0, 100.0, hot=True)
     bot.send(o)
     act = json.loads(bot.next_line())
     f = act.get("fire", [False, False])
@@ -374,7 +391,7 @@ def synthetic(bot, obs, g, cfg):
 
     # 9. A target inside the mortar's own blast radius: must fall through to the
     #    gun instead of shelling itself.
-    o = duel(900009, [gun0, mortar], 8.0, 100.0)
+    o = duel(900009, [gun0, mortar], 8.0, 100.0, hot=True)
     bot.send(o)
     act = json.loads(bot.next_line())
     f = act.get("fire", [False, False])
@@ -386,7 +403,7 @@ def synthetic(bot, obs, g, cfg):
     hold = []
     for i, (chg, want) in enumerate(((0.0, True), (0.30, True), (0.90 * lc + 0.05, False))):
         o = duel(900010 + i, [gun0, mkweapon("laser", 315.0, 1.65, 0.0, 280.0, charge=chg)],
-                 8.0, 100.0)
+                 8.0, 100.0, hot=True)
         bot.send(o)
         act = json.loads(bot.next_line())
         f = act.get("fire", [False, False])
@@ -394,13 +411,10 @@ def synthetic(bot, obs, g, cfg):
     out["laser_charge_hold"] = hold
     out["laser_pass"] = all(got == want for _, got, want in hold)
 
-    # 13. Out-gunned: six healthy weapons converging makes the trade unwinnable,
-    #     so the bot must not CLOSE on the target -- but it must still shoot back.
-    #     `engage` gates approaching, not firing: the gun costs no energy, the
-    #     squad shares vision so we are already located, and a kill is a place
-    #     point. Withholding fire on open shots is what sank the builds after the
-    #     1.42 one (tools/los_audit.py: 87 of 112 open in-range shots passed up).
-    o = duel(900013, [gun0], 60.0, 1400.0, extra_lasers=5)
+    # 13. Under fire and out-gunned: still answer -- a hiding bot that is being
+    #     shot at has already been found, so refusing to shoot costs HP for
+    #     nothing -- but do not close on a losing trade; relocate instead.
+    o = duel(900013, [gun0], 60.0, 1400.0, extra_lasers=5, hot=True)
     bot.send(o)
     act = json.loads(bot.next_line())
     f = act.get("fire", [False, False])
@@ -476,67 +490,31 @@ def synthetic(bot, obs, g, cfg):
         d["crates"] = [{"id": 4242, "pos": [crate_xy[0], crate_xy[1], top], "hp": 300.0}]
         return d
 
+    # 14. RUN AND HIDE farms nothing and climbs nothing: a roof crate at the
+    #     wall and a tower crate beyond reach are both ignored -- no jump, no
+    #     jet, no shot. An airborne mech is loud and sky-lined.
     roof = find_roof()
     out["roof_found"] = roof is not None
     if roof:
         top, ax, ay, sx, sy, gz = roof
         out["roof_climb_m"] = round(top - gz, 1)
-
-        # 14. Grounded at the wall, tank full: must target the roof crate and
-        #     start the climb (the jump is the tell -- nothing else sets it).
         o = roof_obs(900014, roof, 100.0, True, (sx, sy))
+        o["t"] = 110.0  # 10 s after test 13's hit: quiet, so no sprint either
         bot.send(o)
         act = json.loads(bot.next_line())
-        mv = act.get("move", [0.0, 0.0])
-        to = (sx - ax, sy - ay)
-        nn = math.hypot(*to)
-        d_dot = (mv[0] * to[0] + mv[1] * to[1]) / (nn * max(1e-9, math.hypot(*mv))) if nn > 1e-6 else 0.0
-        out["roof_approach"] = round(d_dot, 3)
-        out["roof_jump"] = bool(act.get("jump"))
-        lab = (act.get("debug") or {}).get("label", "")
-        out["roof_su_pass"] = " su1.2" in lab  # config.mech.step_up, not rules.maxStep 1.5
-        out["roof_pass"] = d_dot > 0.7 and bool(act.get("jump"))
+        f = act.get("fire", [False, False])
+        out["no_climb_jump"] = bool(act.get("jump"))
+        out["no_climb_boost"] = bool(act.get("boost"))
+        out["no_climb_fire"] = bool(f[0]) or bool(f[1])
+        out["no_climb_pass"] = (not out["no_climb_jump"] and not out["no_climb_boost"]
+                                and not out["no_climb_fire"])
 
-        # 15. Airborne mid-climb: boost away from the ground IS the jet.
-        o = roof_obs(900015, roof, 100.0, False, (sx, sy), dz=3.0)
-        bot.send(o)
-        act = json.loads(bot.next_line())
-        out["roof_air_boost"] = bool(act.get("boost"))
-        out["roof_air_pass"] = bool(act.get("boost")) and not bool(act.get("jump"))
-
-        # 16. Tank nearly empty: must hold and regenerate, not half-climb and
-        #     fall. A climb needs energy >= cost + reserve, before committing.
-        o = roof_obs(900016, roof, 5.0, True, (sx, sy))
-        bot.send(o)
-        act = json.loads(bot.next_line())
-        mv = act.get("move", [0.0, 0.0])
-        out["roof_low_energy"] = [bool(act.get("jump")), bool(act.get("boost")),
-                                  round(math.hypot(*mv), 3)]
-        out["roof_low_pass"] = (not act.get("jump")) and (not act.get("boost")) and \
-            math.hypot(*mv) < 0.05
-
-    # 17. A tower past the tank's reach must NOT be targeted: better to ignore
-    # the crate than to fly at a wall and fall off halfway.
-    tower = find_tower()
-    out["tower_found"] = tower is not None
-    if tower and roof:
-        tx, ty, ttop = tower
-        top, ax, ay, sx, sy, gz = roof
-        o = roof_obs(900017, roof, 100.0, True, (sx, sy))
-        o["crates"] = [{"id": 4243, "pos": [tx, ty, ttop], "hp": 300.0}]
-        o["self"]["pos"] = [tx + 6.0, ty, g.terrain_h(tx + 6.0, ty)]
-        bot.send(o)
-        act = json.loads(bot.next_line())
-        out["tower_climb_m"] = round(ttop - g.terrain_h(tx, ty), 1)
-        out["tower_jump"] = bool(act.get("jump"))
-        out["tower_pass"] = not bool(act.get("jump"))
-
-    # 18. Unarmed with a laser 120 m east -- past the old 60 m search radius.
-    #     Slot 1 nearly doubles return-fire damage (gun 156 -> gun+laser 287
-    #     dps), and every kill is a place point, so the walk must be worth it.
+    # 18. A laser 120 m east while unarmed: not taken, not chased, not shot at.
+    #     The hide strategy takes nothing -- even a free weapon is a detour
+    #     through the open for a bot whose whole value is arriving untouched.
     o = json.loads(json.dumps(base))
     o["tick"] = 900018
-    o["t"] = 100.0
+    o["t"] = 120.0  # quiet: 10 s after the roof test, nobody shooting
     o["mechs"] = []
     o["offer"] = None
     o["events"] = []
@@ -552,10 +530,10 @@ def synthetic(bot, obs, g, cfg):
                      "pos": [x + 120.0, y, g.terrain_h(x + 120.0, y)]}]
     bot.send(o)
     act = json.loads(bot.next_line())
+    f = act.get("fire", [False, False])
     mv = act.get("move", [0.0, 0.0])
-    east = mv[0] / max(1e-9, math.hypot(*mv))
-    out["arm_east"] = round(east, 3)
-    out["arm_pass"] = east > 0.6
+    out["arm_east"] = round(mv[0] / max(1e-9, math.hypot(*mv)), 3)
+    out["arm_pass"] = act.get("take") is None and not f[0] and not f[1]
 
     return out
 
@@ -685,15 +663,13 @@ def main():
     for k in ("base_tick", "base_on_ground",
               "zone_run_dot", "zone_run_boost", "zone_run_pass", "take_id", "take_pass",
               "pick", "pick_pass", "wall_clearance", "wall_pass",
-              "crate_aim_err", "crate_fire", "crate_approach", "crate_pass",
-              "cube_approach", "cube_pass", "cap_fire", "cap_pass",
+              "silent_fire", "silent_take", "silent_pass",
+              "return_fire", "return_fire_pass", "quiet_fire", "quiet_pass",
               "mortar_fire", "mortar_pitch_err", "mortar_pass",
               "mortar_close_fire", "mortar_close_pass",
-              "laser_charge_hold", "laser_pass", "lose_fire", "lose_pass",
-              "roof_found", "roof_climb_m", "roof_approach", "roof_jump", "roof_su_pass",
-              "roof_pass", "roof_air_boost", "roof_air_pass",
-              "roof_low_energy", "roof_low_pass",
-              "tower_found", "tower_climb_m", "tower_jump", "tower_pass",
+              "laser_charge_hold", "laser_pass", "lose_fire", "lose_approach", "lose_pass",
+              "roof_found", "roof_climb_m",
+              "no_climb_jump", "no_climb_boost", "no_climb_fire", "no_climb_pass",
               "arm_east", "arm_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")

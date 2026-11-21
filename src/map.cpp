@@ -268,4 +268,16 @@ bool Map::shot_los(const Vec3& a, const Vec3& b) const {
   return true;
 }
 
+double Map::sight_run(double x, double y, double z, double dx, double dy,
+                      double cap, double step) const {
+  for (double d = step; d <= cap; d += step) {
+    const double px = x + dx * d;
+    const double py = y + dy * d;
+    if (!in_bounds(px, py)) return d;           // the arena edge is a wall
+    if (terrain_h(px, py) >= z) return d;       // rising ground closes the line
+    if (solid_point(px, py, z)) return d;       // a building closes the line
+  }
+  return cap;
+}
+
 }  // namespace mech
