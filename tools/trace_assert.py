@@ -613,14 +613,25 @@ def synthetic(bot, obs, g, cfg):
         o["mechs"] = [{"id": 78, "npc": False, "pos": [ex, ey, ez], "vel": [0.0, 0.0, 0.0],
                        "aim": [0.0, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0.0,
                        "weapons": ["gun"]}]
+        # Step A: torso still horizontal (pitch 0.0, pointing at the wall).
+        # Must command the lob pitch while holding fire so we do not shoot the
+        # wall in front of us before the tube elevates.
+        bot.send(o)
+        act_slew = json.loads(bot.next_line())
+        f_slew = act_slew.get("fire", [False, False])
+        # Step B: torso has slewed to the lob pitch -> now it pulls the trigger.
+        o["tick"] = 9000191
+        o["self"]["aim"] = [math.atan2(ey - uy, ex - ux), want_p]
         bot.send(o)
         act = json.loads(bot.next_line())
         f = act.get("fire", [False, False])
         pitch = act.get("aim", [0.0, 0.0])[1]
+        out["lob_slew_hold"] = not bool(f_slew[0]) and not bool(f_slew[1])
         out["lob_fire"] = [bool(f[0]), bool(f[1])]
         out["lob_pitch"] = round(pitch, 3)
         out["lob_pitch_want"] = round(want_p, 3)
-        out["lob_pass"] = bool(f[1]) and abs(pitch - want_p) < 0.05
+        out["lob_pass"] = (out["lob_slew_hold"] and bool(f[1]) and not bool(f[0])
+                           and abs(pitch - want_p) < 0.05)
 
     # 20. Hurt: under fire from one hunter at 120 m but down to a sliver of
     #     HP -- the committed duel is off. Survive first: relocate away.
@@ -633,6 +644,19 @@ def synthetic(bot, obs, g, cfg):
     rad = mv[0] / max(1e-9, math.hypot(*mv))
     out["hurt_approach"] = round(rad, 3)
     out["hurt_pass"] = rad < 0.3
+
+    # 21. Mortar cooldown gun-weave: when the mortar just fired (cooldown 2.0 s)
+    #     and the enemy is in line of sight at 60 m, do NOT lock out slot 0 for
+    #     2.6 s -- switch to the gun and fire between shells.
+    mortar_cd = mkweapon("mortar", 200.0, 2.6, mv if isinstance(mv, (int, float)) else 72.0, 230.0)
+    mortar_cd["cooldown"] = 2.0
+    o = duel(900021, [gun0, mortar_cd], 60.0, 800.0, hot=True)
+    o["t"] = 141.0
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    f = act.get("fire", [False, False])
+    out["weave_fire"] = [bool(f[0]), bool(f[1])]
+    out["weave_pass"] = bool(f[0]) and not bool(f[1])
 
     return out
 
@@ -770,8 +794,9 @@ def main():
               "roof_found", "roof_climb_m",
               "no_climb_jump", "no_climb_boost", "no_climb_fire", "no_climb_pass",
               "arm_east", "arm_pass",
-              "lob_found", "lob_fire", "lob_pitch", "lob_pitch_want", "lob_pass",
-              "hurt_approach", "hurt_pass"):
+              "lob_found", "lob_slew_hold", "lob_fire", "lob_pitch", "lob_pitch_want", "lob_pass",
+              "hurt_approach", "hurt_pass",
+              "weave_fire", "weave_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")

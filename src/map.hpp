@@ -68,6 +68,13 @@ class Map {
   // Line of sight for a shot: prisms and terrain block, trees do not.
   bool shot_los(const Vec3& a, const Vec3& b) const;
 
+  // Does a ballistic arc launched from `m` at (yaw, pitch) with speed `v` and
+  // gravity `g` fly clear of terrain and buildings until `tof`? Checks barrel
+  // clearance first (3 m out along the aim), then samples the parabola up to
+  // 95% of `tof` so the landing surface at the target does not self-reject.
+  bool arc_clear(const Vec3& m, double yaw, double pitch, double v, double g,
+                 double tof) const;
+
  private:
   struct Prism {
     double base = 0.0, top = 0.0;

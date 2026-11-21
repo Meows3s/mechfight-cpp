@@ -176,11 +176,18 @@ class MechBot final : public Bot {
     // fresh however far apart the observations are (real ones come 0.1 s
     // apart; a `+= dt` after the reset would call a brand-new hit 76 s old).
     threat_age_ += dt;
-    for (const auto& e : o.events)
+    combat_age_ += dt;
+    for (const auto& e : o.events) {
       if (e.type == "damaged" && e.has_bearing) {
         threat_bearing_ = e.bearing;
         threat_age_ = 0.0;
+        combat_age_ = 0.0;
+      } else if (e.type == "hit" && e.target >= 0 && e.target < 100) {
+        // Our own hits on a mech keep the fight hot even while our strafing
+        // makes their return shots miss for 3+ seconds.
+        combat_age_ = 0.0;
       }
+    }
 
     const Circle zone = predicted_zone(o);
     const double margin = mech_radius_ + 6.0;
@@ -195,7 +202,7 @@ class MechBot final : public Bot {
     // a shell from behind a wall costs no HP at all.
     const Actor* enemy = pick_enemy(o, me);
     const Actor* spotter = spotted(o, me);
-    const bool under_fire = threat_age_ < 3.0;
+    const bool under_fire = threat_age_ < 4.5 || combat_age_ < 4.5;
     const bool mortar_armed = me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Mortar;
     const bool need_weapon = !me.has_weapon[1];
     int attackers = 0;
@@ -225,32 +232,44 @@ class MechBot final : public Bot {
                      12.0);
       a.boost = !me.in_zone && dist2(me_xy, zone.center) > 25.0;
       hide_state_ = 0;
-    } else if (need_weapon && !under_fire) {
-      // ARM. best_pickup ranks mortar > laser > lightning and finds nothing
-      // once a mortar is held, so this phase ends itself. The detour is
-      // exposure, so sprint it -- but only while nobody is within earshot
-      // (boost carries ~90 m; the spotter test is 150 m, conservative).
-      if (const Pickup* loot = best_pickup(o, me_xy, 180.0, &zone, margin)) {
+    } else if (!mortar_armed && !under_fire) {
+      // ARM / UPGRADE TO MORTAR. best_pickup ranks mortar > laser > lightning
+      // and finds nothing once a mortar is held. Unarmed we search 180 m;
+      // holding laser/lightning we still detour up to 95 m for a mortar swap.
+      const double loot_r = need_weapon ? 180.0 : 95.0;
+      if (const Pickup* loot = best_pickup(o, me_xy, loot_r, &zone, margin)) {
         a.move = avoid(me.pos,
                        norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]},
                                {1.0, 0.0}),
                        12.0);
         a.boost = !spotter && dist2(xy(loot->pos), me_xy) > 30.0;
         hide_state_ = 0;
+      } else if (const Item* cube = nearest_cube(o, me_xy, zone)) {
+        // Loose cubes on the ground are silent and free (+4% HP/dmg + upgrades).
+        a.move = avoid(me.pos,
+                       norm_or({cube->pos[0] - me_xy[0], cube->pos[1] - me_xy[1]},
+                               {1.0, 0.0}),
+                       12.0);
+        hide_state_ = 0;
       } else {
         // Nothing in view: hold covered ground and keep sweeping -- the sweep
         // is what finds the pickups.
-        steer_hide(a, me, me_xy, zone, true, nullptr, false);
+        steer_hide(a, me, me_xy, zone, true, spotter, false);
       }
     } else if (has_arc) {
-      // BOMBARD: hold the covered spot and shell them over the wall. Shells
-      // are audible, but hiding already proved quiet buys nothing, and a
-      // kill is +1 place.
-      steer_hide(a, me, me_xy, zone, true, nullptr, under_fire);
+      // BOMBARD: hold the covered spot and shell them over the wall. If they
+      // have direct sight on us inside 95 m while we hold a mortar (cook-off
+      // risk against lasers), slide to a covered spot further away while
+      // shelling.
+      const bool exposed_close =
+          enemy && enemy_d < 95.0 && have_map_ &&
+          map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},
+                        {me.pos[0], me.pos[1], me.pos[2] + 4.5});
+      steer_hide(a, me, me_xy, zone, true, exposed_close ? enemy : nullptr, under_fire);
     } else if (mortar_armed && enemy && enemy_d < 150.0) {
-      // Armed but no arc (they are inside the lob's floor): kite. Opening
-      // range re-solves the ballistic window, and covered ground away from
-      // them is where the next volley comes from.
+      // Armed but no arc (they are inside the lob's floor behind a wall): kite.
+      // Opening range re-solves the ballistic window, and covered ground away
+      // from them is where the next volley comes from.
       steer_hide(a, me, me_xy, zone, true, enemy, under_fire);
     } else if (duel) {
       // Committed 1v1, M1's mode: close to standoff and trade. The rare
@@ -899,38 +918,46 @@ class MechBot final : public Bot {
   }
 
   // Mortar: solve the launch pitch, iterating on time-of-flight so the shell
-  // lands where the target will be. Prefers the flat arc, but lobs over the top
-  // when a building is in the way -- which is what a mortar is for.
+  // lands where the target will be. Prefers the flat arc when the parabola is
+  // clear, and lobs over the top when a building blocks the flat line --
+  // checking actual parabolic clearance (Map::arc_clear) on both so we never
+  // fire a flat shell into the wall we are hiding behind.
   bool mortar_aim(const Vec3& m, const Vec3& pt, const Vec3& vel, bool leadable, Vec2& aim) const {
     const WeaponCfg& mc = wc_[wi(WeaponKind::Mortar)];
     const double v = mc.speed > 1.0 ? mc.speed : 72.0;
     const double g = mortar_gravity_;
     Vec3 t = pt;
     double pitch = 0.0;
-    for (int it = 0; it < 3; ++it) {
+    double yaw = 0.0;
+    for (int it = 0; it < 4; ++it) {
       const double dx = t[0] - m[0], dy = t[1] - m[1], dz = t[2] - m[2];
       const double d = hypot2(dx, dy);
       if (d < 1.0) return false;
+      yaw = std::atan2(dy, dx);
       double flat = 0.0, lob = 0.0;
       const bool has_flat =
           solve_pitch(d, dz, v, g, false, flat) && flat >= min_pitch_ && flat <= max_pitch_;
       const bool has_lob =
           solve_pitch(d, dz, v, g, true, lob) && lob >= min_pitch_ && lob <= max_pitch_;
-      const bool straight = !have_map_ || map_.shot_los(m, t);
-      if (has_flat && straight) {
+      const double tof_flat = has_flat ? d / std::max(1.0, v * std::cos(flat)) : 0.0;
+      const double tof_lob = has_lob ? d / std::max(1.0, v * std::cos(lob)) : 0.0;
+      const bool flat_clear =
+          has_flat && (!have_map_ || (map_.shot_los(m, t) &&
+                                      map_.arc_clear(m, yaw, flat, v, g, tof_flat)));
+      const bool lob_clear =
+          has_lob && (!have_map_ || map_.arc_clear(m, yaw, lob, v, g, tof_lob));
+      if (flat_clear) {
         pitch = flat;
-      } else if (has_lob) {
-        pitch = lob;  // over the top
-      } else if (has_flat) {
-        pitch = flat;
+      } else if (lob_clear) {
+        pitch = lob;  // over the top, verified clear of walls
       } else {
-        return false;
+        return false; // neither arc clears geometry; caller will kite to open range
       }
-      if (!leadable) break;
+      if (!leadable || it == 3) break;
       const double tof = d / (v * std::cos(pitch));
       t = {pt[0] + vel[0] * tof, pt[1] + vel[1] * tof, pt[2] + vel[2] * tof};
     }
-    aim = {std::atan2(t[1] - m[1], t[0] - m[0]), pitch};
+    aim = {yaw, pitch};
     return true;
   }
 
@@ -948,11 +975,11 @@ class MechBot final : public Bot {
                  bool allow_fire) const {
     Shot s;
     const Vec3 m = muzzle(me);
+    const double d = dist3(m, pt);
+    const bool los = !have_map_ || map_.shot_los(m, pt);
     for (int slot = 0; slot < 2; ++slot) {
       if (!me.has_weapon[slot]) continue;
       const Weapon& w = me.weapons[slot];
-      const double d = dist3(m, pt);
-      const bool los = !have_map_ || map_.shot_los(m, pt);
       Vec2 aim{};
       bool fire = false;
 
@@ -967,20 +994,35 @@ class MechBot final : public Bot {
         }
         case WeaponKind::Lightning: {
           if (d > weapon_range(w) || me.energy < lightning_cost_) continue;
+          if (w.cooldown > 0.12 && los) continue;  // cooling down: let the gun lead
           aim = aim_at(m, pt);  // instant along the aim: no lead
           fire = los;
           break;
         }
         case WeaponKind::Laser: {
           if (d > weapon_range(w)) continue;
+          // During the 1.65 s cooldown after a beam, yield to the gun so we
+          // do not throw away 156 dps staring at the target waiting on slot 1.
+          if (w.cooldown > 0.12 && w.charge <= 0.0 && los) continue;
           aim = aim_at(m, pt);  // hitscan: no lead
           fire = laser_trigger(w, me, los && angle_diff(me.aim[0], aim[0]) < kAligned);
           break;
         }
         case WeaponKind::Mortar: {
           if (d < mortar_min_range_) continue;  // this close, its own splash hits us
+          // Mortar cooldown is 2.6 s; slewing the tube takes ~0.4 s. When we
+          // have direct sight on the enemy and >0.45 s left on the mortar
+          // cooldown, yield to the gun so we fire 8-9 gun rounds between
+          // shells instead of locking out slot 0 for 2.6 s.
+          if (w.cooldown > 0.45 && los) continue;
           if (!mortar_aim(mortar_tube(me, mech_height_), pt, vel, leadable, aim)) continue;
-          fire = true;
+          // Wait for the torso to slew to the launch yaw AND pitch before
+          // pulling the trigger (turn_rate 4, pitch_rate 3 rad/s). Firing at
+          // pitch 0 while commanding a 1.2 rad lob shoots horizontally into
+          // the wall in front of us.
+          const bool aligned =
+              angle_diff(me.aim[0], aim[0]) < 0.25 && std::fabs(me.aim[1] - aim[1]) < 0.25;
+          fire = (w.cooldown <= 0.05) && aligned;
           break;
         }
       }
@@ -1030,8 +1072,31 @@ class MechBot final : public Bot {
     }
     a.aim = s.aim;
     a.fire[s.slot] = s.fire;
-    const Weapon& w = me.weapons[s.slot];
-    if (w.kind == WeaponKind::Gun && w.ammo <= 0.0 && w.reload <= 0.0) a.reload = true;
+    // Dual-fire: when slot 1 is a direct-fire weapon (laser or lightning --
+    // NEVER mortar, whose gravity pitch aims gun bullets over the target's
+    // head and wastes the 12-round magazine) and slot 0 (the gun) has a clear
+    // line aligned with the torso, pull trigger 0 too for full combined DPS.
+    if (s.slot == 1 && allow_fire && me.weapons[1].kind != WeaponKind::Mortar &&
+        me.has_weapon[0] && me.weapons[0].kind == WeaponKind::Gun &&
+        me.weapons[0].ammo != 0.0 && me.weapons[0].reload <= 0.0) {
+      const Vec3 m = muzzle(me);
+      const double d = dist3(m, pt);
+      if (d <= weapon_range(me.weapons[0]) && (!have_map_ || map_.shot_los(m, pt))) {
+        const double sp = me.weapons[0].speed > 1.0 ? me.weapons[0].speed : 252.0;
+        const double tof = leadable ? d / sp : 0.0;
+        const Vec2 g_aim =
+            aim_at(m, Vec3{pt[0] + vel[0] * tof, pt[1] + vel[1] * tof, pt[2] + vel[2] * tof});
+        if (angle_diff(s.aim[0], g_aim[0]) < 0.08 && std::fabs(s.aim[1] - g_aim[1]) < 0.06) {
+          a.fire[0] = true;
+        }
+      }
+    }
+    for (int slot = 0; slot < 2; ++slot) {
+      if (me.has_weapon[slot] && me.weapons[slot].kind == WeaponKind::Gun &&
+          me.weapons[slot].ammo <= 0.0 && me.weapons[slot].reload <= 0.0) {
+        a.reload = true;
+      }
+    }
   }
 
   // ---------------------------------------------------------------- drawing
@@ -1111,6 +1176,7 @@ class MechBot final : public Bot {
   double last_t_ = -1.0;
   double threat_bearing_ = 0.0;
   double threat_age_ = 1e9;
+  double combat_age_ = 1e9;
   double strafe_sign_ = 1.0;
   double strafe_until_ = 0.0;
   std::uint32_t rng_ = 1;

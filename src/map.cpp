@@ -280,4 +280,33 @@ double Map::sight_run(double x, double y, double z, double dx, double dy,
   return cap;
 }
 
+bool Map::arc_clear(const Vec3& m, double yaw, double pitch, double v, double g,
+                    double tof) const {
+  if (tof <= 1e-4) return false;
+  const double cp = std::cos(pitch), sp = std::sin(pitch);
+  const double dx = cp * std::cos(yaw), dy = cp * std::sin(yaw), dz = sp;
+  // Barrel + self-splash guard: the shot originates 3 m along the aim, and any
+  // obstacle within the 7 m splash radius detonates the shell on us.
+  for (double b : {1.5, 3.0, 5.0, 7.5}) {
+    if (b >= v * tof * 0.9) break;
+    const double t = b / std::max(1.0, v);
+    const double bx = m[0] + v * dx * t;
+    const double by = m[1] + v * dy * t;
+    const double bz = m[2] + v * dz * t - 0.5 * g * t * t;
+    if (!in_bounds(bx, by) || bz <= terrain_h(bx, by) || solid_point(bx, by, bz))
+      return false;
+  }
+  const double horiz = v * cp * tof;
+  const int steps = std::max(12, static_cast<int>(horiz / 2.5));
+  for (int i = 1; i < steps; ++i) {
+    const double t = tof * (0.95 * static_cast<double>(i) / steps);
+    const double px = m[0] + v * dx * t;
+    const double py = m[1] + v * dy * t;
+    const double pz = m[2] + v * dz * t - 0.5 * g * t * t;
+    if (!in_bounds(px, py) || pz <= terrain_h(px, py) || solid_point(px, py, pz))
+      return false;
+  }
+  return true;
+}
+
 }  // namespace mech
