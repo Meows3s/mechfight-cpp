@@ -62,8 +62,13 @@ double angle_diff(double a, double b) {
 
 // Lower rank = better. Unknown upgrades sink to the bottom.
 int upgrade_rank(const std::string& id) {
-  static const char* kOrder[] = {"armor",  "plating", "servos",  "capacitor", "reactor",
-                                 "nanites", "gyros",  "jets",    "sensors"};
+  static const char* kOrder[] = {
+      "armor",           "plating",         "nanites",              "mortar_reload",
+      "mortar_splash",   "gun_damage",      "gun_rate",             "servos",
+      "laser_damage",    "gun_velocity",    "gun_mag",              "mortar_velocity",
+      "capacitor",       "reactor",         "gyros",                "jets",
+      "lightning_chain", "lightning_range", "lightning_efficiency", "laser_pierce",
+      "sensors",         "laser_charge"};
   for (int i = 0; i < static_cast<int>(sizeof(kOrder) / sizeof(kOrder[0])); ++i)
     if (id == kOrder[i]) return i;
   return 1000;
@@ -211,17 +216,29 @@ class MechBot final : public Bot {
     const double hp_frac = me.max_hp > 0.0 ? me.hp / me.max_hp : 1.0;
     const double enemy_d =
         enemy ? hypot2(enemy->pos[0] - me_xy[0], enemy->pos[1] - me_xy[1]) : 1e18;
+    // Fast deterministic strafe reversal (0.85..1.30 s): ground_accel (58.5)
+    // reverses walk_speed (11.7) in 0.40 s, matching bullet flight time at
+    // 100 m so linear velocity lead shoots behind us instead of tracking a
+    // 3-second arc.
+    if (o.t >= strafe_until_) {
+      strafe_sign_ = -strafe_sign_;
+      strafe_until_ = o.t + 0.85 + 0.45 * ((next_rand() >> 8) * (1.0 / 16777216.0));
+    }
     // Can the mortar reach them from here? Behind cover the flat arc is
     // blocked and the lob must fit under max_pitch -- which physics only
     // allows beyond ~125 m (solve_pitch: A = g d^2 / 2v^2 grows with range, so
     // close-in lobs are steeper than the turret can point).
+    const double mortar_spd =
+        (mortar_armed && me.weapons[1].speed > 1.0) ? me.weapons[1].speed : 0.0;
     Vec2 arc_aim{0.0, 0.0};
-    const bool has_arc = mortar_armed && enemy &&
-                         mortar_aim(mortar_tube(me, mech_height_), centre(*enemy),
-                                    enemy->vel, true, arc_aim);
+    const bool has_arc =
+        mortar_armed && enemy &&
+        mortar_aim(mortar_tube(me, mech_height_), centre(*enemy), enemy->vel, true, arc_aim,
+                   mortar_spd);
     // The committed duel: one visible hunter, we are healthy, no mortar (with
     // a mortar we never close -- that is what the shells are for).
     const bool duel = under_fire && !mortar_armed && attackers == 1 && hp_frac > 0.6 && enemy;
+    const Actor* threat = enemy ? enemy : spotter;
 
     if (!settled) {
       // Outside the closing circle that death is certain; everything else is
@@ -251,34 +268,36 @@ class MechBot final : public Bot {
                                {1.0, 0.0}),
                        12.0);
         hide_state_ = 0;
+      } else if (const mf::Drop* drop = safe_drop(o, me, me_xy, zone, margin)) {
+        // Uncontested nearby supply drop: 3 cubes + full HP + full energy.
+        if (dist2(xy(drop->pos), me_xy) > drop->radius * 0.5) {
+          a.move = avoid(me.pos,
+                         norm_or({drop->pos[0] - me_xy[0], drop->pos[1] - me_xy[1]},
+                                 {1.0, 0.0}),
+                         12.0);
+        } else {
+          a.move = {0.0, 0.0};
+        }
+        hide_state_ = 0;
       } else {
         // Nothing in view: hold covered ground and keep sweeping -- the sweep
         // is what finds the pickups.
-        steer_hide(a, me, me_xy, zone, true, spotter, false);
+        steer_hide(a, me, me_xy, zone, true, threat, false, mortar_armed);
       }
     } else if (has_arc) {
-      // BOMBARD: hold the covered spot and shell them over the wall. If they
-      // have direct sight on us inside 95 m while we hold a mortar (cook-off
-      // risk against lasers), slide to a covered spot further away while
-      // shelling.
-      const bool exposed_close =
-          enemy && enemy_d < 95.0 && have_map_ &&
-          map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},
-                        {me.pos[0], me.pos[1], me.pos[2] + 4.5});
-      steer_hide(a, me, me_xy, zone, true, exposed_close ? enemy : nullptr, under_fire);
+      // BOMBARD: pick a spot that blocks the enemy's direct sightline while
+      // keeping them in the mortar's 125-215 m lob window, and never stand
+      // still if they currently have direct line of sight on us.
+      steer_hide(a, me, me_xy, zone, true, threat, under_fire, mortar_armed);
     } else if (mortar_armed && enemy && enemy_d < 150.0) {
       // Armed but no arc (they are inside the lob's floor behind a wall): kite.
       // Opening range re-solves the ballistic window, and covered ground away
       // from them is where the next volley comes from.
-      steer_hide(a, me, me_xy, zone, true, enemy, under_fire);
+      steer_hide(a, me, me_xy, zone, true, enemy, under_fire, mortar_armed);
     } else if (duel) {
       // Committed 1v1, M1's mode: close to standoff and trade. The rare
       // opening win is worth a whole place, and a retreating gun fight at
       // 156 dps never saved anyone.
-      if (o.t >= strafe_until_) {
-        strafe_sign_ = (next_rand() & 1u) ? 1.0 : -1.0;
-        strafe_until_ = o.t + 2.0 + 2.0 * ((next_rand() >> 8) * (1.0 / 16777216.0));
-      }
       const Vec2 u = norm_or({enemy->pos[0] - me_xy[0], enemy->pos[1] - me_xy[1]}, {1.0, 0.0});
       const double radial =
           enemy_d > standoff_ + 12.0 ? 1.0 : (enemy_d < standoff_ - 12.0 ? -1.0 : 0.0);
@@ -289,22 +308,23 @@ class MechBot final : public Bot {
                      12.0);
       hide_state_ = 3;
     } else {
-      // COVER / FLEE: covered ground away from whoever has seen us; sprint
-      // and answer once they are actually shooting.
-      steer_hide(a, me, me_xy, zone, true, spotter, under_fire);
+      // COVER / FLEE: covered ground that puts a building between us and the
+      // threat; sprint and answer once they are actually shooting.
+      steer_hide(a, me, me_xy, zone, true, threat, under_fire, mortar_armed);
     }
 
     // Fire whenever we hold the mortar (the arc needs no line of sight -- that
     // is the entire point), whenever we are in active combat, or whenever we
-    // are mid-charge on a laser so we never drop a charged beam. When armed
-    // and completely alone in cover, pop nearby ground crates in LOS with the
-    // arm gun for free cubes/upgrades and 50% mortar drops.
+    // are mid-charge on a laser so we never drop a charged beam. When alone in
+    // cover (and no floor weapon is waiting to be picked up), pop nearby
+    // ground crates in LOS with the arm gun for cubes/upgrades and 50% weapon
+    // drops.
     const bool laser_charging =
         me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Laser && me.weapons[1].charge > 0.0;
     const Actor* fire_enemy =
         (under_fire || laser_charging || (mortar_armed && enemy)) ? enemy : nullptr;
-    const Farm crate_farm = (!fire_enemy && me.has_weapon[1] && !enemy && !spotter &&
-                             !under_fire && me.cubes < kCubeTarget)
+    const Farm crate_farm = (!fire_enemy && (me.has_weapon[1] || o.pickups.empty()) && !enemy &&
+                             !spotter && !under_fire && me.cubes < kCubeTarget)
                                 ? pick_safe_crate(o, me, zone, margin)
                                 : Farm{};
     shoot(a, me, fire_enemy, crate_farm);
@@ -871,19 +891,39 @@ class MechBot final : public Bot {
           if (map_.sight_run(x, y, tz, std::cos(ang), std::sin(ang), 48.0) < 48.0) ++blocked;
         }
         const double cover = static_cast<double>(blocked) / kDirs;
-        if (cover >= 0.25) hide_spots_.push_back({x, y, cover});
+        if (cover >= 0.25) hide_spots_.push_back({x, y, z, cover});
       }
     }
   }
 
+  // Uncontested landed/landing supply drop nearby when we need HP or cubes.
+  const mf::Drop* safe_drop(const Obs& o, const Self& me, const Vec2& me_xy,
+                            const Circle& zone, double margin) const {
+    if (me.hp >= me.max_hp * 0.92 && me.cubes >= kCubeTarget) return nullptr;
+    const mf::Drop* best = nullptr;
+    double best_d = 65.0;
+    for (const auto& d : o.drops) {
+      if (d.lands_in > 4.0) continue;
+      if (std::fabs(d.pos[2] - me.pos[2]) > 3.8) continue;
+      if (dist2(xy(d.pos), zone.center) > zone.radius - margin) continue;
+      const double dist = dist2(xy(d.pos), me_xy);
+      if (dist < best_d) {
+        best_d = dist;
+        best = &d;
+      }
+    }
+    return best;
+  }
+
   // Hold the most covered spot inside the circle the zone is closing to, and
-  // sit on it. Cover first, deep-in-the-circle second, a short walk third,
-  // away from whoever has seen us, and sticky so near-equal spots do not
-  // dither us across open ground. No covered ground left (the open endgame):
-  // hold the centre -- by then it is an HP auction, not a hiding contest.
+  // sit on it. When a threat is known, strongly prefer spots where a building
+  // actually blocks the threat's direct line of sight (not merely spots near a
+  // wall that happens to be behind us!), and when mortar-armed, prefer spots
+  // inside the 125-215 m lob window. Never stand still while exposed to direct
+  // line of sight.
   void steer_hide(Action& a, const Self& me, const Vec2& me_xy,
                   const Circle& zone, bool settled, const Actor* spotter,
-                  bool under_fire) {
+                  bool under_fire, bool mortar_armed = false) {
     if (!settled) {
       // Outside the closing circle that death is certain; cover is not the
       // problem. Get back in.
@@ -896,23 +936,32 @@ class MechBot final : public Bot {
       return;
     }
     const double margin = mech_radius_ + 6.0;
+    const Vec3 threat_muz =
+        spotter ? Vec3{spotter->pos[0], spotter->pos[1], spotter->pos[2] + 7.0} : Vec3{};
     const HideSpot* best = nullptr;
     double best_rank = -1e18;
     for (const auto& s : hide_spots_) {
       const double dc = hypot2(s.x - zone.center[0], s.y - zone.center[1]);
       if (dc > zone.radius - margin) continue;
-      double rank = s.cover * 300.0 - 0.2 * dc - 0.1 * hypot2(s.x - me_xy[0], s.y - me_xy[1]);
+      double rank = s.cover * 300.0 - 0.2 * dc - 0.12 * hypot2(s.x - me_xy[0], s.y - me_xy[1]);
       if (s.x == hide_tx_ && s.y == hide_ty_) rank += 25.0;  // stickiness
-      if (spotter)
-        // When someone has seen us, opening the range dominates cover quality:
-        // the best-covered spot 60 m from their muzzles is still 60 m from
-        // their muzzles. Up to 375 rank points of separation.
-        rank += std::min(hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]), 250.0) * 1.5;
+      if (spotter) {
+        const double ds = hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]);
+        rank += std::min(ds, 250.0) * 1.5;
+        if (have_map_ && !map_.shot_los(threat_muz, {s.x, s.y, s.z + 4.5})) {
+          // A building is actually between this spot and the shooter.
+          rank += 450.0;
+          if (mortar_armed && ds >= 125.0 && ds <= 215.0) rank += 200.0;
+        }
+      }
       if (rank > best_rank) {
         best_rank = rank;
         best = &s;
       }
     }
+    const bool exposed_now =
+        spotter && have_map_ &&
+        map_.shot_los(threat_muz, {me.pos[0], me.pos[1], me.pos[2] + 4.5});
     if (!best) {
       if (dist2(me_xy, zone.center) > 6.0) {
         a.move = avoid(me.pos,
@@ -920,6 +969,11 @@ class MechBot final : public Bot {
                                {1.0, 0.0}),
                        12.0);
         hide_state_ = 0;
+      } else if (exposed_now) {
+        const Vec2 u = norm_or({spotter->pos[0] - me_xy[0], spotter->pos[1] - me_xy[1]},
+                               {1.0, 0.0});
+        a.move = avoid(me.pos, {-u[1] * strafe_sign_, u[0] * strafe_sign_}, 10.0);
+        hide_state_ = 2;
       } else {
         a.move = {0.0, 0.0};
         hide_state_ = 1;
@@ -930,7 +984,16 @@ class MechBot final : public Bot {
     hide_ty_ = best->y;
     const double d = hypot2(best->x - me_xy[0], best->y - me_xy[1]);
     if (d < 4.0) {
-      a.move = {0.0, 0.0};  // parked: standing still is the only silent posture
+      if (exposed_now) {
+        // Never sit still in direct line of sight of a hunter: strafe
+        // perpendicular so linear-leaded gun rounds and shells miss.
+        const Vec2 u = norm_or({spotter->pos[0] - me_xy[0], spotter->pos[1] - me_xy[1]},
+                               {1.0, 0.0});
+        a.move = avoid(me.pos, {-u[1] * strafe_sign_, u[0] * strafe_sign_}, 10.0);
+        hide_state_ = 2;
+        return;
+      }
+      a.move = {0.0, 0.0};  // parked and occluded: silent posture
       hide_state_ = 1;
       return;
     }
@@ -1021,9 +1084,10 @@ class MechBot final : public Bot {
   // clear, and lobs over the top when a building blocks the flat line --
   // checking actual parabolic clearance (Map::arc_clear) on both so we never
   // fire a flat shell into the wall we are hiding behind.
-  bool mortar_aim(const Vec3& m, const Vec3& pt, const Vec3& vel, bool leadable, Vec2& aim) const {
+  bool mortar_aim(const Vec3& m, const Vec3& pt, const Vec3& vel, bool leadable, Vec2& aim,
+                  double v_override = 0.0) const {
     const WeaponCfg& mc = wc_[wi(WeaponKind::Mortar)];
-    const double v = mc.speed > 1.0 ? mc.speed : 72.0;
+    const double v = v_override > 1.0 ? v_override : (mc.speed > 1.0 ? mc.speed : 72.0);
     const double g = mortar_gravity_;
     Vec3 t = pt;
     double pitch = 0.0;
@@ -1114,7 +1178,8 @@ class MechBot final : public Bot {
           // cooldown, yield to the gun so we fire 8-9 gun rounds between
           // shells instead of locking out slot 0 for 2.6 s.
           if (w.cooldown > 0.45 && los) continue;
-          if (!mortar_aim(mortar_tube(me, mech_height_), pt, vel, leadable, aim)) continue;
+          if (!mortar_aim(mortar_tube(me, mech_height_), pt, vel, leadable, aim, w.speed))
+            continue;
           // Wait for the torso to slew to the launch yaw AND pitch before
           // pulling the trigger (turn_rate 4, pitch_rate 3 rad/s). Firing at
           // pitch 0 while commanding a 1.2 rad lob shoots horizontally into
@@ -1267,7 +1332,7 @@ class MechBot final : public Bot {
 
   // Run-and-hide state (see steer_hide).
   struct HideSpot {
-    double x = 0.0, y = 0.0, cover = 0.0;  // cover: blocked sightline fraction
+    double x = 0.0, y = 0.0, z = 0.0, cover = 0.0;  // cover: blocked sightline fraction
   };
   std::vector<HideSpot> hide_spots_;
   double hide_tx_ = 1e18, hide_ty_ = 1e18;  // the spot we are holding
