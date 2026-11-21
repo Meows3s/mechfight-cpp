@@ -489,10 +489,21 @@ class MechBot final : public Bot {
       a.move = {0.0, 0.0};  // hold still and regenerate rather than waste the tank
       return;
     }
-    a.move = avoid(me.pos,
-                   norm_or({goal_xy[0] - me_xy[0], goal_xy[1] - me_xy[1]}, {1.0, 0.0}), 6.0);
+    const double goal_z = me.pos[2] + need;  // `need` is the remaining rise, not a height
+    // Press STRAIGHT at the goal, with no avoid() probing. While climbing we
+    // want to be shoved into the wall, not steered around it: wall sliding keeps
+    // us alongside it and we rise cleanly, whereas avoid() -- which seeks the
+    // clearest heading -- makes the mech orbit the building and burn the tank in
+    // open air (found by tools/sim.py: x oscillated -98 <-> -107 while rising).
+    a.move = norm_or({goal_xy[0] - me_xy[0], goal_xy[1] - me_xy[1]}, {1.0, 0.0});
     a.jump = me.grounded;   // leave the ground; jumping needs it
-    a.boost = !me.grounded; // in the air, boost *is* the jet
+    // Jet only while short of the roofline. Holding the jet past it sails us over
+    // the roof and we never come down: tools/sim.py showed the mech reach the
+    // crate's x,y at z=14.8 with the roofline at 14.9, then climb to 17.6, drift
+    // off the side and oscillate for the rest of the match. Cutting at roofline +
+    // 0.5 is the clearance needed to cross the lip, and step_up (1.2) then walks
+    // us on as soon as our centre is over it.
+    a.boost = !me.grounded && me.pos[2] < goal_z + 0.5;
     climb_until_ = o.t + 0.5;  // remember we are mid-climb, for the draw label
   }
 
@@ -576,7 +587,15 @@ class MechBot final : public Bot {
       const double ahead = have_map_ ? map_.clearance(me.pos, to_goal, 6.0, mech_height_, step_up_,
                                                       max_slope_)
                                      : 6.0;
-      if (need > step_up_ + 0.2 && (ahead < 3.0 || dist2(goal_xy, me_xy) <= kClimbStartRange)) {
+      // Keep climbing until the goal is *reached*, not merely until it is within
+      // one step_up. The old `need > step_up_ + 0.2` handed control back to this
+      // farm branch while we were still 1.4 m under the roofline, and that branch
+      // steers with avoid() -- which swung the mech back off the edge and dropped
+      // it (tools/sim.py: z climbed to 16.8 then fell to 6.7, over and over).
+      // While airborne we also hold the climb for a metre *past* the goal, so the
+      // push that carries us over the lip survives through to the landing.
+      const bool climbing = need > 0.2 || (!me.grounded && need > -1.0);
+      if (climbing && (ahead < 3.0 || dist2(goal_xy, me_xy) <= kClimbStartRange)) {
         climb(a, o, me, me_xy, goal_xy, need);
         return;
       }
