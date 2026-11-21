@@ -772,6 +772,37 @@ def synthetic(bot, obs, g, cfg):
     out["laser_juke_boost"] = bool(act_lj.get("boost"))
     out["laser_juke_pass"] = out["laser_juke_perp"] > 0.6 and out["laser_juke_boost"]
 
+    # 26. Rear/blind-spot ambush response: hit from bearing 2.4 rad while
+    #     obs.mechs is empty (attacker is >45 m away outside our 120-deg FOV).
+    #     Must NOT overwrite threat_bearing_ with the idle scan: must snap
+    #     aim[0] to 2.4 rad, relocate (|move| > 0.5), and boost.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900026
+    o["t"] = 190.0
+    o["mechs"] = []
+    o["offer"] = None
+    o["cubes"] = []
+    o["crates"] = []
+    o["pickups"] = []
+    o["projectiles"] = []
+    o["self"]["grounded"] = True
+    o["self"]["in_zone"] = True
+    o["self"]["aim"] = [0.0, 0.0]
+    x, y, z = o["self"]["pos"]
+    o["zone"] = {"center": [x, y], "radius": 600.0, "next_center": [x, y],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 220.0, "dps": 20.0}
+    o["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun",
+                    "bearing": 2.4, "by": 12, "rear": True}]
+    bot.send(o)
+    act_amb = json.loads(bot.next_line())
+    aim_amb = act_amb.get("aim", [0.0, 0.0])[0]
+    mv_amb = act_amb.get("move", [0.0, 0.0])
+    out["ambush_aim_err"] = round(abs((aim_amb - 2.4 + math.pi) % (2 * math.pi) - math.pi), 4)
+    out["ambush_move"] = round(math.hypot(*mv_amb), 3)
+    out["ambush_boost"] = bool(act_amb.get("boost"))
+    out["ambush_pass"] = (out["ambush_aim_err"] < 0.02 and out["ambush_move"] > 0.5
+                          and out["ambush_boost"])
+
     return out
 
 
@@ -914,7 +945,8 @@ def main():
               "roof_loot_take", "roof_loot_east", "roof_loot_pass",
               "dodge_boost", "dodge_pass",
               "mortar_mem_boost", "mortar_mem_pass",
-              "laser_juke_perp", "laser_juke_boost", "laser_juke_pass"):
+              "laser_juke_perp", "laser_juke_boost", "laser_juke_pass",
+              "ambush_aim_err", "ambush_move", "ambush_boost", "ambush_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")

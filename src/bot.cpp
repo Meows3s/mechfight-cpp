@@ -209,6 +209,16 @@ class MechBot final : public Bot {
     const Actor* enemy = pick_enemy(o, me);
     const Actor* spotter = spotted(o, me);
     const bool under_fire = threat_age_ < 4.5 || combat_age_ < 4.5;
+    // If we are taking fire from outside our 120-deg FOV wedge (enemy/spotter
+    // still nullptr until our torso turns around), synthesize the shooter's
+    // position along threat_bearing_ so steer_hide() relocates immediately
+    // instead of sitting parked at move = [0, 0] with our back turned.
+    Actor unseen_shooter{};
+    if (!spotter && threat_age_ < 4.5) {
+      unseen_shooter.pos = {me_xy[0] + std::cos(threat_bearing_) * 110.0,
+                            me_xy[1] + std::sin(threat_bearing_) * 110.0, me.pos[2]};
+      spotter = &unseen_shooter;
+    }
     const bool mortar_armed = me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Mortar;
     const bool need_weapon = !me.has_weapon[1];
     int attackers = 0;
@@ -325,21 +335,48 @@ class MechBot final : public Bot {
         Vec2 am = aim_at(muzzle(me), centre(*enemy));
         am[1] = std::clamp(am[1], min_pitch_, max_pitch_);
         a.aim = am;
+      } else if (threat_age_ < 4.0) {
+        // Hit from outside our 120-deg FOV wedge: whip the torso around to
+        // threat_bearing_ (0.5 s at turn_rate 4 rad/s) so our 180-deg front
+        // armor faces the shooter AND they enter our vision wedge to be shot.
+        // Previously the else branch below overwrote this with the slow scan!
+        a.aim = {threat_bearing_, 0.0};
       } else {
-        // Quiet: sweep the torso. A fixed wedge leaves 240 deg of blind
-        // approach, and scanning costs only aim time we are not using.
-        a.aim = {std::fmod(o.t * 0.4, 2.0 * kPi) - kPi, 0.0};
+        // Quiet: look toward any fresh near/mid mech sound to spot approaching
+        // hunters early; otherwise sweep 360 deg at 2.2 rad/s (2.85 s per
+        // revolution instead of the old 15.7 s).
+        double sound_yaw = 0.0;
+        bool have_sound = false;
+        int best_dist = 99;
+        for (const auto& s : o.sounds) {
+          if (s.age > 0.6 || s.dist == mf::Dist::Far) continue;
+          if (s.kind == "npc_gun" || s.kind == "drop" || s.kind == "crate") continue;
+          const int dr = (s.dist == mf::Dist::Near) ? 0 : 1;
+          if (!have_sound || dr < best_dist) {
+            best_dist = dr;
+            sound_yaw = s.bearing;
+            have_sound = true;
+          }
+        }
+        if (have_sound) {
+          a.aim = {sound_yaw, 0.0};
+        } else {
+          a.aim = {std::fmod(o.t * 2.2, 2.0 * kPi) - kPi, 0.0};
+        }
       }
     }
 
-    // Under fire and they still hold a shot line (and we are not the one
-    // closing on them): sprint -- 19.5 m/s against their 11.7 -- while
-    // covered ground is re-opened. In the air boost *is* the jet, so only
-    // ever sprint grounded.
-    if (under_fire && enemy && !duel && have_map_ && me.grounded &&
-        map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},  // muzzle_height
-                      {me.pos[0], me.pos[1], me.pos[2] + 4.5})) {
-      a.boost = true;
+    // Under fire and they still hold a shot line (or shot us from outside our
+    // FOV wedge): sprint -- 19.5 m/s against their 11.7 -- while covered
+    // ground is re-opened. In the air boost *is* the jet, so only ever sprint
+    // grounded.
+    if (under_fire && !duel && me.grounded) {
+      const bool exposed_shot =
+          (enemy && have_map_ &&
+           map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},
+                         {me.pos[0], me.pos[1], me.pos[2] + 4.5})) ||
+          (!enemy && threat_age_ < 2.5);
+      if (exposed_shot) a.boost = true;
     }
     dodge_hazards(a, o, me, me_xy);
     draw(a, o, me, zone, enemy, Farm{});
