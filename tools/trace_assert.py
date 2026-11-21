@@ -658,6 +658,58 @@ def synthetic(bot, obs, g, cfg):
     out["weave_fire"] = [bool(f[0]), bool(f[1])]
     out["weave_pass"] = bool(f[0]) and not bool(f[1])
 
+    # 22. Rooftop pickup trap: a mortar sitting 15 m above us on a roof (within
+    #     2 m horizontally) cannot be taken (protocol section 6: |dz| <= 4 m)
+    #     and must not trap the bot when a ground laser sits 40 m east.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900022
+    o["t"] = 155.0
+    o["mechs"] = []
+    o["offer"] = None
+    o["events"] = []
+    o["cubes"] = []
+    o["crates"] = []
+    o["self"]["cubes"] = 0
+    o["self"]["in_zone"] = True
+    o["self"]["weapons"] = [o["self"]["weapons"][0], None]
+    x, y, z = o["self"]["pos"]
+    o["zone"] = {"center": [x, y], "radius": 600.0, "next_center": [x, y],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 180.0, "dps": 20.0}
+    o["pickups"] = [
+        {"id": 8301, "kind": "mortar", "pos": [x + 2.0, y, z + 15.0]},
+        {"id": 8302, "kind": "laser", "pos": [x + 40.0, y, g.terrain_h(x + 40.0, y)]},
+    ]
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    mv_r = act.get("move", [0.0, 0.0])
+    out["roof_loot_take"] = act.get("take")
+    out["roof_loot_east"] = round(mv_r[0] / max(1e-9, math.hypot(*mv_r)), 3)
+    out["roof_loot_pass"] = act.get("take") is None and out["roof_loot_east"] > 0.6
+
+    # 23. Incoming mortar shell dodge: a shell on a trajectory landing within
+    #     splash range must trigger grounded boost to escape the blast ring.
+    o = json.loads(json.dumps(base))
+    o["tick"] = 900023
+    o["t"] = 160.0
+    o["mechs"] = []
+    o["offer"] = None
+    o["events"] = []
+    o["cubes"] = []
+    o["crates"] = []
+    o["pickups"] = []
+    o["self"]["grounded"] = True
+    o["self"]["in_zone"] = True
+    x, y, z = o["self"]["pos"]
+    o["zone"] = {"center": [x, y], "radius": 600.0, "next_center": [x, y],
+                 "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 180.0, "dps": 20.0}
+    o["projectiles"] = [{"id": 399, "kind": "mortar",
+                         "pos": [x - 30.0, y, z + 11.0],
+                         "vel": [60.0, 0.0, 0.0]}]
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    out["dodge_boost"] = bool(act.get("boost"))
+    out["dodge_pass"] = out["dodge_boost"]
+
     return out
 
 
@@ -796,7 +848,9 @@ def main():
               "arm_east", "arm_pass",
               "lob_found", "lob_slew_hold", "lob_fire", "lob_pitch", "lob_pitch_want", "lob_pass",
               "hurt_approach", "hurt_pass",
-              "weave_fire", "weave_pass"):
+              "weave_fire", "weave_pass",
+              "roof_loot_take", "roof_loot_east", "roof_loot_pass",
+              "dodge_boost", "dodge_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")

@@ -295,12 +295,21 @@ class MechBot final : public Bot {
     }
 
     // Fire whenever we hold the mortar (the arc needs no line of sight -- that
-    // is the entire point) or whenever we are under fire. A gun from hiding at
-    // an enemy we can see but who has not shot back buys nothing and costs our
-    // position; the LOS gate inside shoot() still refuses rounds into walls.
-    shoot(a, me, (under_fire || (mortar_armed && enemy)) ? enemy : nullptr, Farm{});
+    // is the entire point), whenever we are in active combat, or whenever we
+    // are mid-charge on a laser so we never drop a charged beam. When armed
+    // and completely alone in cover, pop nearby ground crates in LOS with the
+    // arm gun for free cubes/upgrades and 50% mortar drops.
+    const bool laser_charging =
+        me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Laser && me.weapons[1].charge > 0.0;
+    const Actor* fire_enemy =
+        (under_fire || laser_charging || (mortar_armed && enemy)) ? enemy : nullptr;
+    const Farm crate_farm = (!fire_enemy && me.has_weapon[1] && !enemy && !spotter &&
+                             !under_fire && me.cubes < kCubeTarget)
+                                ? pick_safe_crate(o, me, zone, margin)
+                                : Farm{};
+    shoot(a, me, fire_enemy, crate_farm);
 
-    if (!under_fire && !(mortar_armed && enemy)) {
+    if (!fire_enemy && crate_farm.kind == Farm::Kind::None) {
       if (enemy) {
         // Spotted but not yet shot at: face it. The front arc is 180 deg and
         // turning is silent.
@@ -323,6 +332,7 @@ class MechBot final : public Bot {
                       {me.pos[0], me.pos[1], me.pos[2] + 4.5})) {
       a.boost = true;
     }
+    dodge_hazards(a, o, me, me_xy);
     draw(a, o, me, zone, enemy, Farm{});
     return a;
   }
@@ -492,7 +502,10 @@ class MechBot final : public Bot {
 
   // Best weapon pickup within `radius`, by the mortar > laser > lightning
   // preference and then by distance. Only worth taking if it beats what slot 1
-  // already holds; holding the same kind twice is illegal anyway.
+  // already holds; holding the same kind twice is illegal anyway. Filtered to
+  // our own vertical level (protocol section 6: `take` requires |dz| <= 4 m,
+  // and 25% of floor loot spawns on rooftops -- chasing a roof weapon on foot
+  // traps the mech against the building wall forever).
   const Pickup* best_pickup(const Obs& o, const Vec2& me_xy, double radius, const Circle* zone,
                             double margin) const {
     int held = 999;
@@ -502,6 +515,7 @@ class MechBot final : public Bot {
     double best_d = 1e18;
     for (const auto& p : o.pickups) {
       if (p.kind == WeaponKind::Gun) continue;  // never swap the gun out
+      if (std::fabs(p.pos[2] - o.self.pos[2]) > 3.8) continue;  // on a roof above/below us
       const int pr = weapon_pref(p.kind);
       if (pr >= held) continue;                 // no upgrade over what we hold
       const double d = dist2(xy(p.pos), me_xy);
@@ -525,22 +539,32 @@ class MechBot final : public Bot {
   }
 
   // Least expensive kill that is actually in range: estimated time for us to
-  // finish it, with a mild penalty for distance.
+  // finish it, with a mild penalty for distance. Enemies we can actually hit
+  // right now (direct line of sight or a clear mortar arc) strictly outrank
+  // enemies that ducked behind a building during the 5 s memory window.
   const Actor* pick_enemy(const Obs& o, const Self& me) const {
     const double dps = our_dps(me);
     if (dps <= 0.0) return nullptr;
     double reach = 0.0;
     for (int i = 0; i < 2; ++i)
       if (me.has_weapon[i]) reach = std::max(reach, weapon_range(me.weapons[i]));
+    const bool mortar_armed = me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Mortar;
     const Vec3 m = muzzle(me);
+    const Vec3 tube = mortar_tube(me, mech_height_);
     const Actor* best = nullptr;
     double best_score = 1e18;
     for (const auto& a : o.mechs) {
       if (a.npc) continue;
-      const double d = dist3(m, centre(a));
+      const Vec3 c = centre(a);
+      const double d = dist3(m, c);
       if (d > reach) continue;
+      const bool los = !have_map_ || map_.shot_los(m, c);
+      Vec2 dummy{};
+      const bool arc =
+          mortar_armed && d >= mortar_min_range_ && mortar_aim(tube, c, a.vel, true, dummy);
       const double hp = a.hp > 0.0 ? a.hp : (a.max_hp > 0.0 ? a.max_hp : 1400.0);
-      const double score = (hp / dps) * (1.0 + d / 600.0);
+      double score = (hp / dps) * (1.0 + d / 600.0);
+      if (!los && !arc) score += 1e6;  // behind a wall: only pick if nothing shootable exists
       if (score < best_score) {
         best_score = score;
         best = &a;
@@ -598,6 +622,29 @@ class MechBot final : public Bot {
                want_weapon ? 1.6 : 1.0);
     for (const auto& a : o.mechs)
       if (a.npc) consider(Farm::Kind::Drone, &a, nullptr, centre(a), want_weapon ? 2.4 : 2.0);
+    return best;
+  }
+
+  // Ground crate in direct gun line-of-sight while we sit in cover with no
+  // enemies nearby: breaking it from cover costs no movement and drops a cube
+  // (+4% HP/dmg + upgrade offers) plus a weapon 50% of the time.
+  Farm pick_safe_crate(const Obs& o, const Self& me, const Circle& zone, double margin) const {
+    const Vec3 m = muzzle(me);
+    Farm best;
+    double best_d = 85.0;
+    for (const auto& c : o.crates) {
+      if (std::fabs(c.pos[2] - me.pos[2]) > 3.8) continue;  // ground level only
+      if (dist2(xy(c.pos), zone.center) > zone.radius - margin) continue;
+      const Vec3 aim{c.pos[0], c.pos[1], c.pos[2] + crate_drop_};
+      const double d = dist3(m, aim);
+      if (d >= best_d) continue;
+      if (have_map_ && !map_.shot_los(m, aim)) continue;
+      best_d = d;
+      best.kind = Farm::Kind::Crate;
+      best.crate = &c;
+      best.point = aim;
+      best.dist = d;
+    }
     return best;
   }
 
@@ -899,6 +946,7 @@ class MechBot final : public Bot {
     const Item* best = nullptr;
     double best_d = 45.0;
     for (const auto& c : o.cubes) {
+      if (std::fabs(c.pos[2] - o.self.pos[2]) > 3.8) continue;  // ignore roof cubes from ground
       if (dist2(xy(c.pos), zone.center) > zone.radius) continue;
       const double d = dist2(xy(c.pos), me_xy);
       if (d <= cube_radius_) continue;  // already in pickup range; the server collects it
@@ -908,6 +956,57 @@ class MechBot final : public Bot {
       }
     }
     return best;
+  }
+
+  // Emergency dodge reflex for telegraphed high-damage hazards:
+  // 1. Incoming mortar shells (200 direct + 160 splash + 45 energy concussion):
+  //    trace each visible shell's parabola to impact and sidestep out of the
+  //    blast ring with boost.
+  // 2. Enemy charging a laser (315 damage, or 504 cook-off when we hold a
+  //    mortar!): if they have line of sight to us, sprint perpendicular to
+  //    their aim line so the release misses or hits cover.
+  void dodge_hazards(Action& a, const Obs& o, const Self& me, const Vec2& me_xy) const {
+    for (const auto& p : o.projectiles) {
+      if (p.kind != WeaponKind::Mortar) continue;
+      double best_d = 1e18;
+      Vec2 hit_xy{p.pos[0], p.pos[1]};
+      for (double t = 0.05; t <= 2.6; t += 0.08) {
+        const double sx = p.pos[0] + p.vel[0] * t;
+        const double sy = p.pos[1] + p.vel[1] * t;
+        const double sz = p.pos[2] + p.vel[2] * t - 0.5 * mortar_gravity_ * t * t;
+        const double d = hypot2(sx - me_xy[0], sy - me_xy[1]);
+        if (d < best_d) {
+          best_d = d;
+          hit_xy = {sx, sy};
+        }
+        if (have_map_ && sz <= map_.terrain_h(sx, sy)) break;
+      }
+      if (best_d < splash_radius_ + mech_radius_ + 3.5) {
+        const Vec2 away = norm_or({me_xy[0] - hit_xy[0], me_xy[1] - hit_xy[1]},
+                                  {-p.vel[1], p.vel[0]});
+        a.move = avoid(me.pos, away, 10.0);
+        if (me.grounded) a.boost = true;
+        return;
+      }
+    }
+    for (const auto& e : o.mechs) {
+      if (e.npc || !e.charging) continue;
+      if (have_map_ &&
+          !map_.shot_los({e.pos[0], e.pos[1], e.pos[2] + 7.0},
+                         {me.pos[0], me.pos[1], me.pos[2] + 4.5})) {
+        continue;
+      }
+      if (me.grounded) a.boost = true;
+      if (!a.move || hypot2((*a.move)[0], (*a.move)[1]) < 0.1) {
+        // Seated in cover when a laser starts charging on us: juke sideways.
+        const Vec2 beam{std::cos(e.aim[0]), std::sin(e.aim[0])};
+        const Vec2 to_me{me_xy[0] - e.pos[0], me_xy[1] - e.pos[1]};
+        const double cross = beam[0] * to_me[1] - beam[1] * to_me[0];
+        const Vec2 perp = cross >= 0.0 ? Vec2{-beam[1], beam[0]} : Vec2{beam[1], -beam[0]};
+        a.move = avoid(me.pos, perp, 10.0);
+      }
+      return;
+    }
   }
 
   // ---------------------------------------------------------------- shooting
@@ -966,18 +1065,18 @@ class MechBot final : public Bot {
   // on the target and the charge is nearly full.
   bool laser_trigger(const Weapon& w, const Self& me, bool aligned) const {
     (void)me;
-    if (w.charge <= 0.0) return aligned;                     // start only when on target
-    if (w.charge >= laser_charge_max_ * 0.90) return false;  // let go: near-full beam
-    return true;                                             // already committed; keep charging
+    if (w.charge <= 0.0) return aligned;                        // start only when on target
+    if (w.charge >= laser_charge_max_ * 0.90) return !aligned;  // hold up to hold_s until aligned
+    return true;                                                // already committed; keep charging
   }
 
   Shot plan_shot(const Self& me, const Vec3& pt, const Vec3& vel, bool leadable,
-                 bool allow_fire) const {
+                 bool allow_fire, int max_slots = 2) const {
     Shot s;
     const Vec3 m = muzzle(me);
     const double d = dist3(m, pt);
     const bool los = !have_map_ || map_.shot_los(m, pt);
-    for (int slot = 0; slot < 2; ++slot) {
+    for (int slot = 0; slot < max_slots; ++slot) {
       if (!me.has_weapon[slot]) continue;
       const Weapon& w = me.weapons[slot];
       Vec2 aim{};
@@ -1061,7 +1160,8 @@ class MechBot final : public Bot {
       return;
     }
 
-    const Shot s = plan_shot(me, pt, vel, leadable, allow_fire);
+    const int max_slot = (enemy == nullptr && farm.kind == Farm::Kind::Crate) ? 1 : 2;
+    const Shot s = plan_shot(me, pt, vel, leadable, allow_fire, max_slot);
     if (!s.valid) {
       // Nothing can be brought to bear (out of range, or no line). Still point
       // the torso at it, so incoming fire meets the front arc rather than the back.
