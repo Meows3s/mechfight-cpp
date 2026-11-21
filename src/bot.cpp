@@ -165,16 +165,23 @@ class MechBot final : public Bot {
     const double margin = mech_radius_ + 6.0;
     const bool settled = dist2(me_xy, zone.center) <= zone.radius - margin;
 
-    // Cheapest kill first (low HP costs least to finish), and only committed to
-    // when the trade is predicted to go our way.
+    // Cheapest kill first (low HP costs least to finish). `engage` -- whether the
+    // trade is predicted to go our way -- decides ONLY whether we close on it.
     const Actor* enemy = pick_enemy(o, me);
     const bool engage = enemy != nullptr && winnable(o, me, *enemy);
 
     const Farm farm = (!engage && me.cubes < kCubeTarget) ? pick_farm(o, zone, margin) : Farm{};
 
     steer(a, o, me, me_xy, zone, settled, engage ? enemy : nullptr, farm);
-    shoot(a, me, engage ? enemy : nullptr, farm);
-    draw(a, o, me, zone, engage ? enemy : nullptr, farm);
+    // Fire at the enemy whether or not we are closing on it. Refusing to shoot
+    // while being shot at is strictly dominated: the gun costs no energy to fire,
+    // the squad shares vision so we are already located, and every kill is a place
+    // point. tools/los_audit.py measured the old wiring withholding fire on 87 of
+    // 112 geometrically open in-range shots, which is how a bot that armed itself
+    // sensibly still died first. The line-of-sight gate inside shoot() still
+    // stops us wasting rounds into walls.
+    shoot(a, me, enemy, farm);
+    draw(a, o, me, zone, enemy, farm);
     return a;
   }
 

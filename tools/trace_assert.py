@@ -395,13 +395,21 @@ def synthetic(bot, obs, g, cfg):
     out["laser_pass"] = all(got == want for _, got, want in hold)
 
     # 13. Out-gunned: six healthy weapons converging makes the trade unwinnable,
-    #     so it must hold fire entirely rather than shoot and lose.
+    #     so the bot must not CLOSE on the target -- but it must still shoot back.
+    #     `engage` gates approaching, not firing: the gun costs no energy, the
+    #     squad shares vision so we are already located, and a kill is a place
+    #     point. Withholding fire on open shots is what sank the builds after the
+    #     1.42 one (tools/los_audit.py: 87 of 112 open in-range shots passed up).
     o = duel(900013, [gun0], 60.0, 1400.0, extra_lasers=5)
     bot.send(o)
     act = json.loads(bot.next_line())
     f = act.get("fire", [False, False])
+    mv = act.get("move", [0.0, 0.0])
+    # the enemy sits due east (+x) of us, so a positive radial is closing on it
+    rad = mv[0] / max(1e-9, math.hypot(*mv))
     out["lose_fire"] = [bool(f[0]), bool(f[1])]
-    out["lose_pass"] = not bool(f[0]) and not bool(f[1])
+    out["lose_approach"] = round(rad, 3)
+    out["lose_pass"] = bool(f[0]) and not bool(f[1]) and rad < 0.6
 
     # ---- rooftop pathing --------------------------------------------------
     # A roof crate used to be discarded outright (">3 m above the ground under
