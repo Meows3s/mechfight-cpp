@@ -179,10 +179,19 @@ class MechBot final : public Bot {
     const double margin = mech_radius_ + 6.0;
     const bool settled = dist2(me_xy, zone.center) <= zone.radius - margin;
 
-    // Cheapest kill first (low HP costs least to finish). `engage` -- whether the
-    // trade is predicted to go our way -- decides ONLY whether we close on it.
+    // Cheapest kill first (low HP costs least to finish). `engage` -- whether
+    // the trade is predicted to go our way -- decides ONLY whether we close on
+    // it. A second weapon is hunter parity (gun 156 -> gun+laser 287.5 dps),
+    // so armed we fight like M1 did: close to standoff, strafe, keep firing.
+    // M1 is still the best-scoring submission (1.42) and closing-and-strafing
+    // is the one behaviour every later build dropped; the survival harness
+    // cannot see its value because it resolves fire as hitscan, while the
+    // real server simulates gun rounds with spread and travel time that a
+    // strafing mech partly dodges. Gun-only, keep the 1.27 behaviour instead:
+    // never close, sprint under fire, return fire from range.
     const Actor* enemy = pick_enemy(o, me);
-    const bool engage = enemy != nullptr && winnable(o, me, *enemy);
+    const bool engage = enemy != nullptr &&
+                        (winnable(o, me, *enemy) || me.has_weapon[1]);
 
     const Farm farm = (!engage && me.cubes < kCubeTarget) ? pick_farm(o, zone, margin) : Farm{};
 
