@@ -168,9 +168,7 @@ class MechBot final : public Bot {
     cur_max_energy_ = me.max_energy > 0.0 ? me.max_energy : max_energy_;
 
     take_upgrade(a, o);
-    // RUN AND HIDE takes NOTHING: no take_loot. Even a free weapon at our feet
-    // is a detour this strategy refuses -- its whole value is arriving at the
-    // final melt untouched.
+    take_loot(a, o, me_xy);  // pick up what we stand on -- and swap up to a mortar
 
     // Remember who last hit us and from where: that is what we face when idle.
     // Age the previous bearing BEFORE the events: a damaged event in THIS
@@ -188,25 +186,102 @@ class MechBot final : public Bot {
     const double margin = mech_radius_ + 6.0;
     const bool settled = dist2(me_xy, zone.center) <= zone.radius - margin;
 
-    // RUN AND HIDE. Six submissions of evidence: every build that sought a
-    // fight scored 0.15-1.02, and the two that only answered fire scored
-    // highest (1.23, 1.27). Damage taken is the only currency that has ever
-    // moved the score, because the last ~65 s are a 260 dps melt ordered by
-    // remaining HP. So: take nothing, farm nothing, seek nothing. Sit on the
-    // most covered ground inside the closing circle, silently. When someone
-    // spots us, relocate away. When we are actually hit, quiet is spent
-    // anyway -- sprint, and answer.
-    const Actor* enemy = pick_enemy(o, me);   // only ever a return-fire target
-    const Actor* spotter = spotted(o, me);    // anyone close enough to have seen us
+    // THE MORTAR DUELIST. Seven submissions say the squad finds us whatever
+    // we do (hiding scored 1.08 -- quiet buys nothing), and the one clean
+    // signal in the ledger is that the build that fought most scored best
+    // (M1, 1.42). So fight -- but from places they cannot shoot back: a
+    // mortar arcs over buildings, so covered ground is not somewhere to
+    // wait, it is a firing position. Each kill is a guaranteed +1 place, and
+    // a shell from behind a wall costs no HP at all.
+    const Actor* enemy = pick_enemy(o, me);
+    const Actor* spotter = spotted(o, me);
     const bool under_fire = threat_age_ < 3.0;
+    const bool mortar_armed = me.has_weapon[1] && me.weapons[1].kind == WeaponKind::Mortar;
+    const bool need_weapon = !me.has_weapon[1];
+    int attackers = 0;
+    for (const auto& x : o.mechs)
+      if (!x.npc) ++attackers;
+    const double hp_frac = me.max_hp > 0.0 ? me.hp / me.max_hp : 1.0;
+    const double enemy_d =
+        enemy ? hypot2(enemy->pos[0] - me_xy[0], enemy->pos[1] - me_xy[1]) : 1e18;
+    // Can the mortar reach them from here? Behind cover the flat arc is
+    // blocked and the lob must fit under max_pitch -- which physics only
+    // allows beyond ~125 m (solve_pitch: A = g d^2 / 2v^2 grows with range, so
+    // close-in lobs are steeper than the turret can point).
+    Vec2 arc_aim{0.0, 0.0};
+    const bool has_arc = mortar_armed && enemy &&
+                         mortar_aim(mortar_tube(me, mech_height_), centre(*enemy),
+                                    enemy->vel, true, arc_aim);
+    // The committed duel: one visible hunter, we are healthy, no mortar (with
+    // a mortar we never close -- that is what the shells are for).
+    const bool duel = under_fire && !mortar_armed && attackers == 1 && hp_frac > 0.6 && enemy;
 
-    steer_hide(a, me, me_xy, zone, settled, spotter, under_fire);
-    // Return fire only while under fire: a shot from hiding reveals us for
-    // nothing, and the squad shares vision. The LOS gate inside shoot() still
-    // refuses rounds into walls.
-    shoot(a, me, (under_fire && enemy) ? enemy : nullptr, Farm{});
+    if (!settled) {
+      // Outside the closing circle that death is certain; everything else is
+      // secondary until we are back in.
+      a.move = avoid(me.pos,
+                     norm_or({zone.center[0] - me_xy[0], zone.center[1] - me_xy[1]},
+                             {1.0, 0.0}),
+                     12.0);
+      a.boost = !me.in_zone && dist2(me_xy, zone.center) > 25.0;
+      hide_state_ = 0;
+    } else if (need_weapon && !under_fire) {
+      // ARM. best_pickup ranks mortar > laser > lightning and finds nothing
+      // once a mortar is held, so this phase ends itself. The detour is
+      // exposure, so sprint it -- but only while nobody is within earshot
+      // (boost carries ~90 m; the spotter test is 150 m, conservative).
+      if (const Pickup* loot = best_pickup(o, me_xy, 180.0, &zone, margin)) {
+        a.move = avoid(me.pos,
+                       norm_or({loot->pos[0] - me_xy[0], loot->pos[1] - me_xy[1]},
+                               {1.0, 0.0}),
+                       12.0);
+        a.boost = !spotter && dist2(xy(loot->pos), me_xy) > 30.0;
+        hide_state_ = 0;
+      } else {
+        // Nothing in view: hold covered ground and keep sweeping -- the sweep
+        // is what finds the pickups.
+        steer_hide(a, me, me_xy, zone, true, nullptr, false);
+      }
+    } else if (has_arc) {
+      // BOMBARD: hold the covered spot and shell them over the wall. Shells
+      // are audible, but hiding already proved quiet buys nothing, and a
+      // kill is +1 place.
+      steer_hide(a, me, me_xy, zone, true, nullptr, under_fire);
+    } else if (mortar_armed && enemy && enemy_d < 150.0) {
+      // Armed but no arc (they are inside the lob's floor): kite. Opening
+      // range re-solves the ballistic window, and covered ground away from
+      // them is where the next volley comes from.
+      steer_hide(a, me, me_xy, zone, true, enemy, under_fire);
+    } else if (duel) {
+      // Committed 1v1, M1's mode: close to standoff and trade. The rare
+      // opening win is worth a whole place, and a retreating gun fight at
+      // 156 dps never saved anyone.
+      if (o.t >= strafe_until_) {
+        strafe_sign_ = (next_rand() & 1u) ? 1.0 : -1.0;
+        strafe_until_ = o.t + 2.0 + 2.0 * ((next_rand() >> 8) * (1.0 / 16777216.0));
+      }
+      const Vec2 u = norm_or({enemy->pos[0] - me_xy[0], enemy->pos[1] - me_xy[1]}, {1.0, 0.0});
+      const double radial =
+          enemy_d > standoff_ + 12.0 ? 1.0 : (enemy_d < standoff_ - 12.0 ? -1.0 : 0.0);
+      a.move = avoid(me.pos,
+                     norm_or({u[0] * radial - u[1] * strafe_sign_ * 0.9,
+                              u[1] * radial + u[0] * strafe_sign_ * 0.9},
+                             u),
+                     12.0);
+      hide_state_ = 3;
+    } else {
+      // COVER / FLEE: covered ground away from whoever has seen us; sprint
+      // and answer once they are actually shooting.
+      steer_hide(a, me, me_xy, zone, true, spotter, under_fire);
+    }
 
-    if (!under_fire) {
+    // Fire whenever we hold the mortar (the arc needs no line of sight -- that
+    // is the entire point) or whenever we are under fire. A gun from hiding at
+    // an enemy we can see but who has not shot back buys nothing and costs our
+    // position; the LOS gate inside shoot() still refuses rounds into walls.
+    shoot(a, me, (under_fire || (mortar_armed && enemy)) ? enemy : nullptr, Farm{});
+
+    if (!under_fire && !(mortar_armed && enemy)) {
       if (enemy) {
         // Spotted but not yet shot at: face it. The front arc is 180 deg and
         // turning is silent.
@@ -220,10 +295,11 @@ class MechBot final : public Bot {
       }
     }
 
-    // Under fire and they still hold a shot line: quiet is spent, so sprint --
-    // 19.5 m/s against their 11.7 -- while the relocation re-opens range. In
-    // the air boost *is* the jet, so only ever sprint grounded.
-    if (under_fire && enemy && have_map_ && me.grounded &&
+    // Under fire and they still hold a shot line (and we are not the one
+    // closing on them): sprint -- 19.5 m/s against their 11.7 -- while
+    // covered ground is re-opened. In the air boost *is* the jet, so only
+    // ever sprint grounded.
+    if (under_fire && enemy && !duel && have_map_ && me.grounded &&
         map_.shot_los({enemy->pos[0], enemy->pos[1], enemy->pos[2] + 7.0},  // muzzle_height
                       {me.pos[0], me.pos[1], me.pos[2] + 4.5})) {
       a.boost = true;
@@ -293,6 +369,13 @@ class MechBot final : public Bot {
 
   static Vec3 muzzle(const Self& me) {
     return {me.pos[0], me.pos[1], me.pos[2] + me.muzzle_height()};
+  }
+
+  static Vec3 mortar_tube(const Self& me, double height) {
+    // protocol section 5: the mortar tube is a full mech-height up, at
+    // pos.z + height + 0.5 -- NOT the gun's muzzle height. Aiming the arc from
+    // z + 7 lands every shell long and turns direct hits into splash hits.
+    return {me.pos[0], me.pos[1], me.pos[2] + height + 0.5};
   }
 
   static Vec3 centre(const Actor& a) {
@@ -755,7 +838,10 @@ class MechBot final : public Bot {
       double rank = s.cover * 300.0 - 0.2 * dc - 0.1 * hypot2(s.x - me_xy[0], s.y - me_xy[1]);
       if (s.x == hide_tx_ && s.y == hide_ty_) rank += 25.0;  // stickiness
       if (spotter)
-        rank += std::min(hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]), 250.0) * 0.5;
+        // When someone has seen us, opening the range dominates cover quality:
+        // the best-covered spot 60 m from their muzzles is still 60 m from
+        // their muzzles. Up to 375 rank points of separation.
+        rank += std::min(hypot2(s.x - spotter->pos[0], s.y - spotter->pos[1]), 250.0) * 1.5;
       if (rank > best_rank) {
         best_rank = rank;
         best = &s;
@@ -893,7 +979,7 @@ class MechBot final : public Bot {
         }
         case WeaponKind::Mortar: {
           if (d < mortar_min_range_) continue;  // this close, its own splash hits us
-          if (!mortar_aim(m, pt, vel, leadable, aim)) continue;
+          if (!mortar_aim(mortar_tube(me, mech_height_), pt, vel, leadable, aim)) continue;
           fire = true;
           break;
         }
@@ -966,7 +1052,8 @@ class MechBot final : public Bot {
       a.draw.line(muzzle(me), farm.point, "#40ff90");
       a.draw.point(farm.point, "#40ff90", 8.0);
     }
-    const char* mode = hide_state_ == 2 ? "flee"
+    const char* mode = hide_state_ == 3 ? "duel"
+                     : hide_state_ == 2 ? "flee"
                      : hide_state_ == 1 ? "sit"
                                         : "seek";
     const char* held = me.has_weapon[1] ? weapon_name(me.weapons[1].kind) : "-";

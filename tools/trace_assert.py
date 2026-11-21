@@ -183,9 +183,9 @@ def synthetic(bot, obs, g, cfg):
     out["zone_run_boost"] = bool(act.get("boost"))
     out["zone_run_pass"] = dot > 0.9 and bool(act.get("boost"))
 
-    # 2. RUN AND HIDE takes nothing: even a free weapon at our feet is a detour
-    #    the strategy refuses -- its whole value is arriving at the final melt
-    #    untouched.
+    # 2. A weapon within pickup_radius and an empty slot: must take it. The
+    #    duelist's whole plan is the mortar, and the arm phase ends itself
+    #    once slot 1 is filled.
     o = json.loads(json.dumps(base))
     o["tick"] = 900002
     o["offer"] = None
@@ -195,7 +195,7 @@ def synthetic(bot, obs, g, cfg):
     bot.send(o)
     act = json.loads(bot.next_line())
     out["take_id"] = act.get("take")
-    out["take_pass"] = act.get("take") is None
+    out["take_pass"] = act.get("take") == 8123
 
     # 3. An offer where the best choice is NOT index 0 ("armor" outranks
     #    "sensors" and "jets"): must return the index, not the id.
@@ -233,9 +233,9 @@ def synthetic(bot, obs, g, cfg):
     else:
         out["wall_pass"] = False
 
-    # 5. Silent: a crate, a cube and a weapon pickup all in view, nobody
-    #    shooting -- no fire, no take. A shot broadcasts a bearing to a squad
-    #    that shares vision, and loot means crossing open ground.
+    # 5. Silent, but armed: a crate and a cube in view and a laser at our
+    #    feet -- take the weapon, never fire. Firing broadcasts a bearing to a
+    #    squad that shares vision; loot on our doorstep costs nothing.
     o = json.loads(json.dumps(base))
     o["tick"] = 900005
     o["mechs"] = []
@@ -254,10 +254,12 @@ def synthetic(bot, obs, g, cfg):
     f = act.get("fire", [False, False])
     out["silent_fire"] = [bool(f[0]), bool(f[1])]
     out["silent_take"] = act.get("take")
-    out["silent_pass"] = not f[0] and not f[1] and act.get("take") is None
+    out["silent_pass"] = not f[0] and not f[1] and act.get("take") == 8124
 
-    # 6. Under fire: hit on the last event, an enemy in the open in range --
-    #    return fire. Quiet is already spent once they are shooting at us.
+    # 6. The committed duel: one hunter, we are at full health, we hold no
+    #    mortar -- close on it and trade. The enemy sits 150 m east, beyond
+    #    the 80 m standoff, so closing is the only correct reading; a bot that
+    #    flees instead fails this. Return fire throughout.
     o = json.loads(json.dumps(base))
     o["tick"] = 900006
     o["offer"] = None
@@ -273,13 +275,15 @@ def synthetic(bot, obs, g, cfg):
     x, y, z = o["self"]["pos"]
     o["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun",
                     "bearing": 0.0, "by": 77, "rear": False}]
-    o["mechs"] = [{"id": 77, "npc": False, "pos": [x + 60.0, y, g.terrain_h(x + 60.0, y)],
+    o["mechs"] = [{"id": 77, "npc": False, "pos": [x + 150.0, y, g.terrain_h(x + 150.0, y)],
                    "vel": [0.0, 0.0, 0.0], "aim": [0.0, 0.0], "hp": 1400.0,
                    "max_hp": 1400.0, "cubes": 0.0, "weapons": ["gun"]}]
     bot.send(o)
     act = json.loads(bot.next_line())
+    mv = act.get("move", [0.0, 0.0])
+    out["duel_approach"] = round(mv[0] / max(1e-9, math.hypot(*mv)), 3)
     out["return_fire"] = bool(act.get("fire", [False, False])[0])
-    out["return_fire_pass"] = out["return_fire"]
+    out["return_fire_pass"] = out["return_fire"] and out["duel_approach"] > 0.5
 
     # 7. Quiet: the same enemy in the open in range, but nobody has hit us
     #    recently -- this observation runs 10 s after test 6's hit, so the
@@ -358,9 +362,11 @@ def synthetic(bot, obs, g, cfg):
 
     def arc_pitch(obs_like, dist_east, lob):
         """The launch pitch the mortar should return, computed from the closed
-        form independently of the C++ (src/ballistics.hpp)."""
+        form independently of the C++ (src/ballistics.hpp). Launch height is
+        the TUBE (pos.z + height + 0.5, protocol section 5), not the gun
+        muzzle."""
         x, y, z = obs_like["self"]["pos"]
-        mz = z + obs_like["self"]["stats"].get("muzzle_height", 7.0)
+        mz = z + obs_like["self"]["stats"].get("height", 9.0) + 0.5
         ex, ey = x + dist_east, y
         tz = g.terrain_h(ex, ey) + 4.5  # centre() of a mech with no cubes
         dd = math.hypot(ex - x, ey - y)
@@ -532,8 +538,101 @@ def synthetic(bot, obs, g, cfg):
     act = json.loads(bot.next_line())
     f = act.get("fire", [False, False])
     mv = act.get("move", [0.0, 0.0])
-    out["arm_east"] = round(mv[0] / max(1e-9, math.hypot(*mv)), 3)
-    out["arm_pass"] = act.get("take") is None and not f[0] and not f[1]
+    east = mv[0] / max(1e-9, math.hypot(*mv))
+    out["arm_east"] = round(east, 3)
+    out["arm_pass"] = east > 0.6 and act.get("take") is None and not f[0] and not f[1]
+
+    # 19. From-cover bombardment. A hunter rounds our wall and breaks line of
+    #     sight -- the protocol keeps reporting its real position for
+    #     memory_s (5 s), and that window is the whole point of the mortar:
+    #     shell them over the building while they cannot answer. The enemy is
+    #     listed in o.mechs but the direct line from the tube is closed, so
+    #     the only correct answer is a LOB.
+    mspd = mcfg.get("speed", 72.0)
+    mgrav = mcfg.get("gravity", 22.0)
+    lob_pair = None
+    for pbase, ptop, pring, _holes in g.prisms:
+        if pbase > 0.5 or not (8.0 <= ptop <= 25.0):
+            continue
+        xs = [pring[2 * i] for i in range(len(pring) // 2)]
+        ys = [pring[2 * i + 1] for i in range(len(pring) // 2)]
+        x0, x1, cy = min(xs), max(xs), (min(ys) + max(ys)) / 2.0
+        if x1 - x0 > 120.0:
+            continue  # the pair must be ~150 m apart with the prism between
+        ux, uy = x1 + 6.0, cy
+        ex, ey = ux - 150.0, cy
+        if ex > x0 - 6.0:
+            continue
+        uz, ez = g.terrain_h(ux, uy), g.terrain_h(ex, ey)
+        if g.prism_blocks(ux, uy, uz + 0.1, uz + 9.0) or g.prism_blocks(ex, ey, ez + 0.1, ez + 9.0):
+            continue  # both standing spots must be open
+        tube = [ux, uy, uz + 9.5]
+        torso = [ex, ey, ez + 4.5]
+        blocked = False
+        for i in range(1, 40):
+            t = i / 40.0
+            X = tube[0] + (torso[0] - tube[0]) * t
+            Y = tube[1] + (torso[1] - tube[1]) * t
+            Z = tube[2] + (torso[2] - tube[2]) * t
+            if Z <= g.terrain_h(X, Y) or g.prism_blocks(X, Y, Z, Z + 0.01):
+                blocked = True
+                break
+        if not blocked:
+            continue  # want the direct line closed: that is the test
+        dz = torso[2] - tube[2]
+        A = mgrav * 150.0 * 150.0 / (2.0 * mspd * mspd)
+        disc = 150.0 * 150.0 - 4.0 * A * (dz + A)
+        if disc < 0.0:
+            continue
+        p = math.atan((150.0 + math.sqrt(disc)) / (2.0 * A))  # the lob
+        if not (cfg["mech"]["min_pitch"] <= p <= cfg["mech"]["max_pitch"]):
+            continue
+        lob_pair = (ux, uy, uz, ex, ey, ez, p)
+        break
+    out["lob_found"] = lob_pair is not None
+    if lob_pair:
+        ux, uy, uz, ex, ey, ez, want_p = lob_pair
+        o = json.loads(json.dumps(base))
+        o["tick"] = 900019
+        o["t"] = 130.0
+        o["offer"] = None
+        o["events"] = []
+        o["pickups"] = []
+        o["crates"] = []
+        o["cubes"] = []
+        o["self"]["cubes"] = 0
+        o["self"]["hp"] = 1400.0
+        o["self"]["energy"] = 100.0
+        o["self"]["in_zone"] = True
+        o["self"]["weapons"] = [gun0, mortar]
+        o["self"]["pos"] = [ux, uy, uz]
+        o["self"]["aim"] = [math.atan2(ey - uy, ex - ux), 0.0]
+        o["zone"] = {"center": [ux, uy], "radius": 600.0, "next_center": [ux, uy],
+                     "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0,
+                     "dps": 20.0}
+        o["mechs"] = [{"id": 78, "npc": False, "pos": [ex, ey, ez], "vel": [0.0, 0.0, 0.0],
+                       "aim": [0.0, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0.0,
+                       "weapons": ["gun"]}]
+        bot.send(o)
+        act = json.loads(bot.next_line())
+        f = act.get("fire", [False, False])
+        pitch = act.get("aim", [0.0, 0.0])[1]
+        out["lob_fire"] = [bool(f[0]), bool(f[1])]
+        out["lob_pitch"] = round(pitch, 3)
+        out["lob_pitch_want"] = round(want_p, 3)
+        out["lob_pass"] = bool(f[1]) and abs(pitch - want_p) < 0.05
+
+    # 20. Hurt: under fire from one hunter at 120 m but down to a sliver of
+    #     HP -- the committed duel is off. Survive first: relocate away.
+    o = duel(900020, [gun0], 120.0, 1400.0, hot=True)
+    o["self"]["hp"] = 400.0
+    o["t"] = 140.0
+    bot.send(o)
+    act = json.loads(bot.next_line())
+    mv = act.get("move", [0.0, 0.0])
+    rad = mv[0] / max(1e-9, math.hypot(*mv))
+    out["hurt_approach"] = round(rad, 3)
+    out["hurt_pass"] = rad < 0.3
 
     return out
 
@@ -670,7 +769,9 @@ def main():
               "laser_charge_hold", "laser_pass", "lose_fire", "lose_approach", "lose_pass",
               "roof_found", "roof_climb_m",
               "no_climb_jump", "no_climb_boost", "no_climb_fire", "no_climb_pass",
-              "arm_east", "arm_pass"):
+              "arm_east", "arm_pass",
+              "lob_found", "lob_fire", "lob_pitch", "lob_pitch_want", "lob_pass",
+              "hurt_approach", "hurt_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")
