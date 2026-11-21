@@ -17,7 +17,7 @@ under `src/` is ours.
 | `tools/verify_map.py` — map model vs. an independent reimplementation | **PASS** — 660 terrain queries 0 mismatches, 3960 prism queries 0 mismatches |
 | `tools/verify_ballistics.py` — mortar arc vs. numerical integration | **PASS** — 862 solvable cases, worst trajectory error 2.4e-8 m; all 738 no-solution cases genuinely out of range |
 | `tools/trace_assert.py` — audit of all 300 recorded decisions | **PASS** — 0 wall-bound moves out of 300 probes |
-| `tools/trace_assert.py` — forced synthetic policy paths | **PASS** — 13 paths the stream never reaches (zone run, loot take, upgrade pick, wall probe, crate farm, cube collect, cube cap, mortar arc, mortar self-blast refusal, laser charge/hold/release, out-gunned hold-fire) |
+| `tools/trace_assert.py` — forced synthetic policy paths | **PASS** — 16 paths the stream never reaches (zone run, loot take, upgrade pick, wall probe, crate farm, cube collect, cube cap, mortar arc, mortar self-blast refusal, laser charge/hold/release, out-gunned hold-fire, rooftop climb start, mid-climb jet, low-tank refusal, out-of-reach tower, `step_up` source) |
 | Build time in Docker | ~100 s (limit 10 min) |
 | Practice score | not submitted yet |
 
@@ -96,10 +96,21 @@ Priority order in `act()`:
    points at the goal. Walls, ledges taller than `step_up`, and slopes over
    `max_slope_deg` all count as blocked.
 3. **Farm power cubes** while it is safe: the best crate or NPC drone per unit
-   distance, inside the circle it is heading to and on reachable ground. Crates
-   on rooftops are filtered out, because walking to a crate 10 m up is wasted
-   time. Drones are weighted higher (2 cubes) but crates win when a weapon slot
-   is empty, since half of them drop a weapon.
+   distance, inside the circle it is heading to. A crate is dropped only if the
+   jet cannot reach it — one tank buys about 50 m of climb with 18% kept back,
+   and roofs need a median 15 m (29 energy of the 100), so nearly every roof is
+   fair game. Drones are weighted higher (2 cubes) but crates win when a weapon
+   slot is empty, since half of them drop a weapon.
+
+   **Getting onto a roof** is done without a route search, because on this map
+   nothing blocks the climb: trees are vision-only, fences and water are scenery
+   the server ignores, and no roof has an eave over it. The bot presses toward
+   the crate, and when the wall stops it (or it is within 12 m of a target that
+   is more than `step_up` above it) it jumps and then jetts, holding the tank
+   check first: never commit unless `energy >= cost + 12`, and never climb with
+   anyone inside 90 m, because rising at `max_rise_speed` 10 m/s with `air_accel`
+   12 is a sitting duck. It walks on once its feet are within `step_up` of the
+   roof, since the map already treats a surface that close as walkable.
 4. **Walk over loose cubes** — they are free and already on the ground — and
    detour for a weapon only when a slot is empty.
 5. **Stop at 10 cubes.** That is `cubes.stat_cap`: past it, cubes still scale the
@@ -128,12 +139,19 @@ Priority order in `act()`:
 
 ## Known gaps (milestone 4+)
 
-- **Rooftops are still unreachable.** Navigation is local, not global: steering
-  avoids walls but has no path plan, so it can get stuck in a concave corner and
-  cannot route up onto a roof. A quarter of the crates are up there, and the
-  strategy notes want it fighting from height. This is the biggest gap against
-  the strategy file, and the `reachable()` filter in `pick_farm` deliberately
-  discards those crates until it is fixed.
+- **The climb is unverified end to end.** The kit ships no simulator — only
+  `check.py` against a recorded stream — so what is tested is the *decision*:
+  that a roof crate gets targeted, that the bot jumps at the wall, that it jetts
+  while airborne, that it refuses to commit on an empty tank, and that it ignores
+  a tower past the budget. Whether the mech actually ends up standing on the roof
+  — with `air_accel` 12, wall sliding and the roof-edge rule in play — can only be
+  confirmed on the practice server or against a partial simulator.
+- **No route plan.** Steering is still local and greedy: it follows walls and
+  probes 14 headings, so it can stick in a concave corner and cannot choose
+  between two roofs. A roof only gets climbed if the bot happens to press into
+  the right wall.
+- Energy spent climbing is energy not available for a fight or a boost, and
+  nothing plans that trade across a match yet.
 - The fight estimate prices enemy weapons at **stock** config numbers scaled by
   their cubes, and assumes unknown armour is zero; it sees their weapons only as
   kinds. A heavily upgraded opponent will be misjudged.

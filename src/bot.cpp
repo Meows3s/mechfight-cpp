@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <string>
 
@@ -70,6 +71,13 @@ int upgrade_rank(const std::string& id) {
 
 double weapon_range(const Weapon& w) { return w.range > 1.0 ? w.range : 230.0; }
 
+// One decimal, for the debug label.
+std::string f1(double v) {
+  char b[32];
+  std::snprintf(b, sizeof b, "%.1f", v);
+  return b;
+}
+
 // hello.config["weapons"][w][k], or `d`.
 inline double cfgw(const mf::json& c, const char* w, const char* k, double d) {
   const auto a = c.find("weapons");
@@ -110,11 +118,23 @@ class MechBot final : public Bot {
       wc_[i].reload = cfgw(hello.config, n, "reload", 0.0);
     }
     mortar_min_range_ = splash_radius_ + 6.0;  // closer than this and we eat our own splash
+
+    // The server walks and jets by config.mech, NOT by world.json's rules:
+    // protocol.md section 11 says rules.maxStep/maxSlopeDeg are the *viewer's*
+    // numbers. They disagree -- rules.maxStep is 1.5 while mech.step_up is 1.2 --
+    // and using the map's copy made the planner claim it could walk up 1.4 m
+    // ledges that are really walls.
+    step_up_ = hello.cfg("mech", "step_up", 1.2);
+    max_slope_ = hello.cfg("mech", "max_slope_deg", 50.0);
+    // Jet, for the rooftop climb.
+    jump_speed_ = hello.cfg("mech", "jump_speed", 11.0);
+    gravity_ = hello.cfg("mech", "gravity", 22.0);
+    jet_accel_ = hello.cfg("mech", "jet_accel", 34.0);
+    jet_drain_ = hello.cfg("mech", "jet_drain", 15.0);
+    max_rise_ = hello.cfg("mech", "max_rise_speed", 10.0);
+    max_energy_ = hello.cfg("mech", "energy", 100.0);
+
     have_map_ = map_.load(hello.map_dir, hello.map_files);
-    if (have_map_) {
-      step_up_ = map_.rule_max_step();
-      max_slope_ = map_.rule_max_slope_deg();
-    }
   }
 
   std::string name() const override { return "apex"; }
@@ -128,6 +148,7 @@ class MechBot final : public Bot {
 
     mech_height_ = me.stat("height", mech_height_);
     mech_radius_ = me.stat("radius", mech_radius_);
+    cur_max_energy_ = me.max_energy > 0.0 ? me.max_energy : max_energy_;
 
     take_upgrade(a, o);
     take_loot(a, o, me_xy);
@@ -189,6 +210,10 @@ class MechBot final : public Bot {
   static constexpr double kWinMargin = 1.35;    // demand to win by this much to engage
   static constexpr double kAligned = 0.14;      // rad: "the torso is on the target"
   static constexpr double kThreatRange = 300.0; // beyond this nobody can be shooting us
+  static constexpr double kClimbReserve = 0.18;   // fraction of a tank kept back from a climb
+  static constexpr double kEnergyReserve = 12.0;  // energy always kept back for a fight
+  static constexpr double kClimbSafeRange = 90.0; // never climb with anyone this close
+  static constexpr double kClimbStartRange = 12.0; // start a climb within this of the goal
 
   // ---------------------------------------------------------------- geometry
 
@@ -233,11 +258,6 @@ class MechBot final : public Bot {
                 z.center[1] + (z.next_center[1] - z.center[1]) * u};
     c.radius = z.radius + (z.next_radius - z.radius) * u;
     return c;
-  }
-
-  bool reachable(const Vec3& pos) const {
-    if (!have_map_) return true;
-    return pos[2] - map_.terrain_h(pos[0], pos[1]) <= 3.0;
   }
 
   // ---------------------------------------------------------------- damage model
@@ -394,7 +414,7 @@ class MechBot final : public Bot {
 
     auto consider = [&](Farm::Kind kind, const Actor* drone, const Item* crate, const Vec3& aim,
                         double value) {
-      if (!reachable(aim)) return;
+      if (!affordable_climb(aim)) return;
       if (dist2(xy(aim), zone.center) > zone.radius - margin) return;
       const double d = dist3(m, aim);
       if (d > kFarmRadius) return;
@@ -415,6 +435,65 @@ class MechBot final : public Bot {
     for (const auto& a : o.mechs)
       if (a.npc) consider(Farm::Kind::Drone, &a, nullptr, centre(a), want_weapon ? 2.4 : 2.0);
     return best;
+  }
+
+  // ---------------------------------------------------------------- jet / climb
+
+  // Seconds of jet to rise `h` metres: first `t_acc` accelerating to max_rise at
+  // (jet_accel - gravity), then flat out.
+  double jet_seconds_for(double h) const {
+    const double a = std::max(1.0, jet_accel_ - gravity_);
+    const double t_acc = max_rise_ / a;
+    const double h_acc = 0.5 * a * t_acc * t_acc;
+    if (h <= h_acc) return std::sqrt(std::max(0.0, 2.0 * h / a));
+    return t_acc + (h - h_acc) / max_rise_;
+  }
+
+  double energy_for_climb(double h) const { return jet_seconds_for(h) * jet_drain_; }
+
+  // Height one tank buys once kClimbReserve is kept back: the inverse of
+  // jet_seconds_for. On this map that is ~50 m, which covers all but the towers
+  // (roofs need a median 15 m climb / 29 energy).
+  double climb_budget_m() const {
+    const double t = (cur_max_energy_ * (1.0 - kClimbReserve)) / std::max(0.1, jet_drain_);
+    const double a = std::max(1.0, jet_accel_ - gravity_);
+    const double t_acc = max_rise_ / a;
+    const double h_acc = 0.5 * a * t_acc * t_acc;
+    if (t <= t_acc) return 0.5 * a * t * t;
+    return h_acc + max_rise_ * (t - t_acc);
+  }
+
+  // May we get up to `pos`? Walkable if it is at ground level, otherwise the jet
+  // has to reach it. A local height test, not a route search.
+  bool affordable_climb(const Vec3& pos) const {
+    if (!have_map_) return true;
+    const double need = pos[2] - map_.terrain_h(pos[0], pos[1]);
+    if (need <= 3.0) return true;  // at ground level, just walk
+    return need <= climb_budget_m();
+  }
+
+  // Commit to a climb only if the tank covers it *now*, plus a reserve, and
+  // nothing is shooting at us: rising at 10 m/s with air_accel 12 is a sitting
+  // duck, and running dry halfway up just drops us.
+  bool climb_allowed(const Obs& o, const Self& me, double need) const {
+    if (me.energy < energy_for_climb(need) + kEnergyReserve) return false;
+    const Vec3 m = muzzle(me);
+    for (const auto& e : o.mechs)
+      if (dist3(m, centre(e)) <= kClimbSafeRange) return false;
+    return true;
+  }
+
+  void climb(Action& a, const Obs& o, const Self& me, const Vec2& me_xy, const Vec2& goal_xy,
+             double need) {
+    if (!climb_allowed(o, me, need)) {
+      a.move = {0.0, 0.0};  // hold still and regenerate rather than waste the tank
+      return;
+    }
+    a.move = avoid(me.pos,
+                   norm_or({goal_xy[0] - me_xy[0], goal_xy[1] - me_xy[1]}, {1.0, 0.0}), 6.0);
+    a.jump = me.grounded;   // leave the ground; jumping needs it
+    a.boost = !me.grounded; // in the air, boost *is* the jet
+    climb_until_ = o.t + 0.5;  // remember we are mid-climb, for the draw label
   }
 
   // ---------------------------------------------------------------- steering
@@ -487,9 +566,21 @@ class MechBot final : public Bot {
     }
 
     if (farm.kind != Farm::Kind::None) {
-      a.move = avoid(me.pos,
-                     norm_or({farm.point[0] - me_xy[0], farm.point[1] - me_xy[1]}, {1.0, 0.0}),
-                     12.0);
+      const Vec2 goal_xy{farm.point[0], farm.point[1]};
+      const Vec2 to_goal = norm_or({goal_xy[0] - me_xy[0], goal_xy[1] - me_xy[1]}, {1.0, 0.0});
+      const double need = farm.point[2] - me.pos[2];
+      // A target above us that we cannot walk to is a roof. The trigger is
+      // "blocked, and the goal is up there" rather than a distance test, so it
+      // also works when the crate sits deep inside a big roof: press into the
+      // wall, get stopped by it, then jump and jet.
+      const double ahead = have_map_ ? map_.clearance(me.pos, to_goal, 6.0, mech_height_, step_up_,
+                                                      max_slope_)
+                                     : 6.0;
+      if (need > step_up_ + 0.2 && (ahead < 3.0 || dist2(goal_xy, me_xy) <= kClimbStartRange)) {
+        climb(a, o, me, me_xy, goal_xy, need);
+        return;
+      }
+      a.move = avoid(me.pos, to_goal, 12.0);
       return;
     }
 
@@ -683,7 +774,8 @@ class MechBot final : public Bot {
                  std::to_string(static_cast<int>(kCubeTarget)) + " z" +
                  std::to_string(static_cast<int>(zone.radius)) + " a" +
                  std::to_string(o.alive) + " " + held + " " + mode +
-                 (have_map_ ? "" : " NOMAP"));
+                 (have_map_ ? "" : " NOMAP") + " su" + f1(step_up_) +
+                 (o.t < climb_until_ ? " CLIMB" : ""));
   }
 
   Map map_;
@@ -707,9 +799,18 @@ class MechBot final : public Bot {
   double laser_charge_max_;
   double mech_height_ = 9.0;
   double mech_radius_ = 2.5;
-  double step_up_ = 1.5;
+  double step_up_ = 1.2;  // config.mech.step_up, NOT world.json rules.maxStep (1.5)
   double max_slope_ = 50.0;
   double lookahead_ = 4.0;
+  // Jet, for the rooftop climb.
+  double jump_speed_ = 11.0;
+  double gravity_ = 22.0;
+  double jet_accel_ = 34.0;
+  double jet_drain_ = 15.0;
+  double max_rise_ = 10.0;
+  double max_energy_ = 100.0;
+  double cur_max_energy_ = 100.0;  // live me.max_energy: upgrades raise the climb ceiling
+  double climb_until_ = -1.0;  // o.t until which we consider ourselves mid-climb
 
   double last_t_ = -1.0;
   double threat_bearing_ = 0.0;

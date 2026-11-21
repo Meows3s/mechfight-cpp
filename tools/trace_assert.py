@@ -403,6 +403,126 @@ def synthetic(bot, obs, g, cfg):
     out["lose_fire"] = [bool(f[0]), bool(f[1])]
     out["lose_pass"] = not bool(f[0]) and not bool(f[1])
 
+    # ---- rooftop pathing --------------------------------------------------
+    # A roof crate used to be discarded outright (">3 m above the ground under
+    # it"). Now it is a target if a tank of jet can reach it, and the bot climbs
+    # by pressing into the wall, jumping, then jetting.
+
+    def find_roof(lo=8.0, hi=22.0):
+        """A climbable building, plus a standing spot outside its wall and a
+        crate spot just inside the roof near that wall."""
+        for base, top, ring, holes in g.prisms:
+            if base > 0.5 or top < lo:
+                continue
+            pts = [(ring[2 * i], ring[2 * i + 1]) for i in range(len(ring) // 2)]
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            if not (lo <= top - g.terrain_h(cx, cy) <= hi):
+                continue
+            for q in pts:
+                dx, dy = q[0] - cx, q[1] - cy
+                n = math.hypot(dx, dy) or 1.0
+                ax, ay = q[0] + dx / n * 4.5, q[1] + dy / n * 4.5
+                gz = g.terrain_h(ax, ay)
+                if g.prism_blocks(ax, ay, gz + 1.5, gz + 9.0):
+                    continue                                   # wall in the way
+                sx, sy = q[0] - dx / n * 2.5, q[1] - dy / n * 2.5
+                if not g.prism_blocks(sx, sy, top - 0.5, top):
+                    continue                                   # not roof surface
+                if g.prism_blocks(sx, sy, top + 0.1, top + 1.0):
+                    continue                                   # something above it
+                return (top, ax, ay, sx, sy, gz)
+        return None
+
+    def find_tower(lo=58.0):
+        for base, top, ring, holes in g.prisms:
+            if base > 0.5 or top < 10.0:
+                continue
+            pts = [(ring[2 * i], ring[2 * i + 1]) for i in range(len(ring) // 2)]
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            if top - g.terrain_h(cx, cy) > lo:
+                return (cx, cy, top)
+        return None
+
+    def roof_obs(tick, roof, energy, grounded, crate_xy, dz=0.0):
+        top, ax, ay, sx, sy, gz = roof
+        d = json.loads(json.dumps(base))
+        d["tick"] = tick
+        d["t"] = 100.0
+        d["offer"] = None
+        d["events"] = []
+        d["mechs"] = []
+        d["pickups"] = []
+        d["cubes"] = []
+        d["self"]["cubes"] = 0
+        d["self"]["hp"] = 1400.0
+        d["self"]["energy"] = energy
+        d["self"]["max_energy"] = 100.0
+        d["self"]["grounded"] = grounded
+        d["self"]["in_zone"] = True
+        d["self"]["aim"] = [0.0, 0.0]
+        d["self"]["pos"] = [ax, ay, gz + dz]
+        d["zone"] = {"center": [0.0, 0.0], "radius": 600.0, "next_center": [0.0, 0.0],
+                     "next_radius": 600.0, "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0}
+        d["crates"] = [{"id": 4242, "pos": [crate_xy[0], crate_xy[1], top], "hp": 300.0}]
+        return d
+
+    roof = find_roof()
+    out["roof_found"] = roof is not None
+    if roof:
+        top, ax, ay, sx, sy, gz = roof
+        out["roof_climb_m"] = round(top - gz, 1)
+
+        # 14. Grounded at the wall, tank full: must target the roof crate and
+        #     start the climb (the jump is the tell -- nothing else sets it).
+        o = roof_obs(900014, roof, 100.0, True, (sx, sy))
+        bot.send(o)
+        act = json.loads(bot.next_line())
+        mv = act.get("move", [0.0, 0.0])
+        to = (sx - ax, sy - ay)
+        nn = math.hypot(*to)
+        d_dot = (mv[0] * to[0] + mv[1] * to[1]) / (nn * max(1e-9, math.hypot(*mv))) if nn > 1e-6 else 0.0
+        out["roof_approach"] = round(d_dot, 3)
+        out["roof_jump"] = bool(act.get("jump"))
+        lab = (act.get("debug") or {}).get("label", "")
+        out["roof_su_pass"] = " su1.2" in lab  # config.mech.step_up, not rules.maxStep 1.5
+        out["roof_pass"] = d_dot > 0.7 and bool(act.get("jump"))
+
+        # 15. Airborne mid-climb: boost away from the ground IS the jet.
+        o = roof_obs(900015, roof, 100.0, False, (sx, sy), dz=3.0)
+        bot.send(o)
+        act = json.loads(bot.next_line())
+        out["roof_air_boost"] = bool(act.get("boost"))
+        out["roof_air_pass"] = bool(act.get("boost")) and not bool(act.get("jump"))
+
+        # 16. Tank nearly empty: must hold and regenerate, not half-climb and
+        #     fall. A climb needs energy >= cost + reserve, before committing.
+        o = roof_obs(900016, roof, 5.0, True, (sx, sy))
+        bot.send(o)
+        act = json.loads(bot.next_line())
+        mv = act.get("move", [0.0, 0.0])
+        out["roof_low_energy"] = [bool(act.get("jump")), bool(act.get("boost")),
+                                  round(math.hypot(*mv), 3)]
+        out["roof_low_pass"] = (not act.get("jump")) and (not act.get("boost")) and \
+            math.hypot(*mv) < 0.05
+
+    # 17. A tower past the tank's reach must NOT be targeted: better to ignore
+    #     the crate than to fly at a wall and fall off halfway.
+    tower = find_tower()
+    out["tower_found"] = tower is not None
+    if tower and roof:
+        tx, ty, ttop = tower
+        top, ax, ay, sx, sy, gz = roof
+        o = roof_obs(900017, roof, 100.0, True, (sx, sy))
+        o["crates"] = [{"id": 4243, "pos": [tx, ty, ttop], "hp": 300.0}]
+        o["self"]["pos"] = [tx + 6.0, ty, g.terrain_h(tx + 6.0, ty)]
+        bot.send(o)
+        act = json.loads(bot.next_line())
+        out["tower_climb_m"] = round(ttop - g.terrain_h(tx, ty), 1)
+        out["tower_jump"] = bool(act.get("jump"))
+        out["tower_pass"] = not bool(act.get("jump"))
+
     return out
 
 
@@ -535,7 +655,11 @@ def main():
               "cube_approach", "cube_pass", "cap_fire", "cap_pass",
               "mortar_fire", "mortar_pitch_err", "mortar_pass",
               "mortar_close_fire", "mortar_close_pass",
-              "laser_charge_hold", "laser_pass", "lose_fire", "lose_pass"):
+              "laser_charge_hold", "laser_pass", "lose_fire", "lose_pass",
+              "roof_found", "roof_climb_m", "roof_approach", "roof_jump", "roof_su_pass",
+              "roof_pass", "roof_air_boost", "roof_air_pass",
+              "roof_low_energy", "roof_low_pass",
+              "tower_found", "tower_climb_m", "tower_jump", "tower_pass"):
         if k in syn:
             print(f"  {k:18s} {syn[k]}")
     print("  SYNTHETIC", "PASS" if all(v for k, v in syn.items() if k.endswith("_pass")) else "FAIL")
